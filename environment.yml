@@ -1,0 +1,20 @@
+name: humidclimatologyengine
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - xarray
+  - netcdf4
+  - tqdm
+  - psutil
+  - pyyaml
+  - pytest
+  - jupyter
+  - ipykernel
+  - matplotlib
+  - pandas
+  - pip
+  - pip:
+      - cdsapi

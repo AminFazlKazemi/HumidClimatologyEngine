@@ -1,0 +1,15 @@
+era5_land:
+  t2m_dir: "F:/Kazemi/era5/land/daily/T2m"
+  d2m_dir: "F:/Kazemi/era5/land/daily/Dew_Point_Temperature"
+  sp_dir: "F:/Kazemi/era5/land/daily/Surface_Pressure"
+
+project:
+  output_dir: "C:/c"
+  start_year: 1981
+  end_year: 2020
+  doy_count: 366
+  n_samples: 5000
+  cell_chunk_size: 1024
+  sample_batch_size: 256
+  max_workers: 2
+  random_seed: 20260821
