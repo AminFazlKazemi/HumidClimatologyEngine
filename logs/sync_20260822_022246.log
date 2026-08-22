@@ -1,0 +1,9 @@
+2026-08-22 02:22:46,855 - INFO - ✅ Found gh at: C:\C\gh.exe
+2026-08-22 02:22:47,406 - INFO - ✅ Already logged in.
+2026-08-22 02:22:48,717 - INFO - ℹ️  Repository already exists on GitHub.
+2026-08-22 02:22:48,718 - INFO - 📁 Initializing git repository...
+2026-08-22 02:22:49,123 - INFO - ✅ Git initialized.
+2026-08-22 02:22:49,157 - INFO - 🌐 Adding remote: https://github.com/AminFazlKazemi/HumidClimatologyEngine.git
+2026-08-22 02:22:49,233 - INFO - 🔄 Renaming branch 'master' to 'main'...
+2026-08-22 02:22:49,273 - INFO - 📦 Staging all files...
+2026-08-22 02:22:49,689 - INFO - 📝 Committing: Complete reset - 2026-08-22 02:22
