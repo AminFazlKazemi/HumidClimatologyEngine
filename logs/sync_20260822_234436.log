@@ -1,0 +1,12 @@
+2026-08-22 23:44:36,995 - INFO - ✅ Found gh at: C:\C\gh.exe
+2026-08-22 23:44:37,633 - INFO - ✅ Already logged in.
+2026-08-22 23:44:38,903 - INFO - ℹ️  Repository already exists on GitHub.
+2026-08-22 23:44:38,949 - INFO - 🌐 Remote already set: https://github.com/AminFazlKazemi/HumidClimatologyEngine.git
+2026-08-22 23:44:39,047 - INFO - 🔄 Fetching remote state to create a backup...
+2026-08-22 23:44:40,452 - INFO - 📦 Archiving current remote state to branch: backup/main_20260822_234440
+2026-08-22 23:44:46,571 - INFO - ✅ Backup successfully archived.
+2026-08-22 23:44:46,573 - INFO - 📦 Staging all files...
+2026-08-22 23:44:46,715 - INFO - 📝 Committing: Complete reset - 2026-08-22 23:44
+2026-08-22 23:44:46,912 - INFO - 💥 Force-pushing (with lease) to https://github.com/AminFazlKazemi/HumidClimatologyEngine.git ...
+2026-08-22 23:44:54,042 - INFO - 🚀 Force push successful. Large data files are ignored.
+2026-08-22 23:44:54,164 - INFO - 📊 Report: K:\kazemi\papers\temperature_interpolation\HumidClimatologyEngine\logs\report_20260822_234454.json
