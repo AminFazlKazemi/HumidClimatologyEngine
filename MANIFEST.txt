@@ -1,0 +1,19 @@
+HumidClimatologyEngine v7.5 Review Bundle
+
+Purpose: curated bundle of the latest HumidClimatologyEngine v7.5 code and documentation produced in this conversation.
+
+Included:
+- code/moisture_climatology_v7_5.py          Latest v7.5 engine supplied in this conversation
+- code/bivariate_dominance_report.py         Bivariate model-dominance report generator
+- reference/moisture_climatology_v6.py       Historical/educational v6 baseline
+- README.md                                  Current consolidated README
+- README_v7_5.md                             v7.5 README snapshot
+- docs/HumidClimatologyEngine_v7_5_Detailed_Scientific_Engineering_Reference.pdf
+- docs/HumidClimatologyEngine_v6_vs_v7_5_Detailed_Comparison.pdf
+- docs/HumidClimatologyEngine_v7_5_Bivariate_Dominance_Report_Documentation.pdf
+- docs/HumidClimatologyEngine_v7_5_Bivariate_Dominance_Report_Specification.pdf
+- docs/a_promotional_infographic_social_media_post_styl.png
+
+Important:
+This bundle does NOT include the external ClimateProcessingEngine repository, because it was not supplied as a local archive in this conversation.
+The bundle is therefore ready as the current HumidClimatologyEngine review package, while ClimateProcessingEngine source should be supplied separately for exact code-level porting of its chunk/cache and distribution-fitting implementation.

@@ -1,1603 +1,1531 @@
 # HumidClimatologyEngine
 
-> **Research-grade multivariate moisture climatology framework for ERA5-Land**
->
-> Statistical state: **(T, Td, ln P)** → Monte Carlo propagation → **RH, vapor pressure, mixing ratio, specific humidity**.
+> **ERA5-Land hourly empirical moisture climatology, day-resolved probability modelling, and bivariate dependence analysis**
+
+![HumidClimatologyEngine v7.5 — hourly empirical moisture climatology and bivariate probability modelling](V7_5.png)
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Data](https://img.shields.io/badge/data-ERA5--Land-1F4E79)](https://cds.climate.copernicus.eu/)
-[![Output](https://img.shields.io/badge/output-NetCDF4-4B8BBE)](https://www.unidata.ucar.edu/software/netcdf/)
-[![License](https://img.shields.io/badge/license-MIT-2E7D32)](LICENSE)
+[![ERA5-Land](https://img.shields.io/badge/data-ERA5--Land-1F4E79)](https://cds.climate.copernicus.eu/)
+[![NetCDF4](https://img.shields.io/badge/output-NetCDF4-4B8BBE)](https://www.unidata.ucar.edu/software/netcdf/)
 
-> **Documentation contract:** This README is the human-readable front door to the same scientific contract described in the long-form PDF. The implementation reference is `moisture_climatology_v6.py`; generated documentation must not invent functionality that is not present in the implementation.
+## Contents
 
-> **Implementation reference:** `K:\kazemi\papers\temperature_interpolation\HumidClimatologyEngine\moisture_climatology_v6.py`. This absolute Windows path is retained as the project source-of-truth identifier; it is not copied into the public package as a required runtime path.
->
-> **Release note:** the distributable package contains the upgraded README, the long-form scientific PDF, and the hardened reset utility. The documentation deliberately distinguishes documented implementation behavior from recommended extensions and does not invent absent modules or tests.
-
----
-
-## 1. Executive summary
-
-HumidClimatologyEngine is designed around a simple scientific principle:
-
-> **Do not climatologize nonlinear moisture variables independently when the physically relevant atmospheric state is multivariate.**
-
-The intended workflow models the coupled state
-
-$$
-X = (T, T_d, \ln P)
-$$
-
-for each climatological day and grid cell, retains the dependence structure through a covariance matrix, samples the joint state with deterministic Monte Carlo, and only then evaluates nonlinear moisture diagnostics.
-
-The principal products are:
-
-- relative humidity (RH),
-- vapor pressure (e),
-- mixing ratio (r),
-- specific humidity (q),
-- distributional moments, and
-- explicit Monte Carlo / numerical diagnostics.
-
-This architecture is particularly valuable when the research question depends on **relationships between temperature, dew point, and pressure**, rather than on marginal averages alone.
-
----
-
-## 2. What is actually in this archive
-
-```text
-HumidClimatologyEngine/
-├── moisture_climatology_reset.py
-├── README.md
-└── HumidClimatologyEngine_Professional_Guide.pdf
-```
-
-The reset utility has been hardened rather than expanded into a fictional package structure. The PDF is a regenerated, publication-oriented technical guide derived from the supplied code and documentation. It now supports:
-
-- explicit `--base` selection,
-- `--dry-run`,
-- `--yes` for non-interactive execution,
-- structured logging,
-- path-safety checks,
-- symlink-safe deletion,
-- clear exit codes, and
-- a single explicit allow-list of artifacts.
-
-### What this archive does **not** contain
-
-The original README described a larger repository containing an engine module, tests, packaging metadata, configuration files, notebooks, examples, and changelog/citation/security documents. Those files are not present in the supplied ZIP, so they are not represented here as if they shipped with the archive.
-
-That distinction is deliberate: a publication-quality README should be **accurate before it is impressive**.
+- [1. Scope and release status](#1-scope-and-release-status)
+- [2. v6 versus v7](#2-v6-versus-v7)
+- [3. Scientific data flow](#3-scientific-data-flow)
+- [4. ERA5-Land input contract](#4-era5-land-input-contract)
+- [5. Time indexing and the 5-day centred window](#5-time-indexing-and-the-5-day-centred-window)
+- [6. Climatological calendar](#6-climatological-calendar)
+- [7. Thermodynamic calculations](#7-thermodynamic-calculations)
+- [8. Empirical moment engine](#8-empirical-moment-engine)
+- [9. Two-dimensional probability framework](#9-two-dimensional-probability-framework)
+- [10. Candidate univariate distributions](#10-candidate-univariate-distributions)
+- [11. Bimodal Normal: five-parameter model](#11-bimodal-normal-five-parameter-model)
+- [12. Copula and dependence layer](#12-copula-and-dependence-layer)
+- [13. Model fitting and selection](#13-model-fitting-and-selection)
+- [14. Spatial chunking and station/grid-cell extraction](#14-spatial-chunking-and-stationgrid-cell-extraction)
+- [15. Checkpoints and power-failure recovery](#15-checkpoints-and-power-failure-recovery)
+- [16. Progress reporting and ETA](#16-progress-reporting-and-eta)
+- [17. Production outputs](#17-production-outputs)
+- [18. Bivariate dominance report](#18-bivariate-dominance-report)
+- [19. Provenance and reproducibility](#19-provenance-and-reproducibility)
+- [20. Validation and QA](#20-validation-and-qa)
+- [21. Performance and memory](#21-performance-and-memory)
+- [22. Known limitations and explicit non-claims](#22-known-limitations-and-explicit-non-claims)
+- [23. Repository / release layout](#23-repository--release-layout)
+- [24. Operational runbook](#24-operational-runbook)
+- [25. Configuration reference](#25-configuration-reference)
+- [26. Example commands](#26-example-commands)
+- [27. Scientific interpretation](#27-scientific-interpretation)
+- [28. Release checklist](#28-release-checklist)
+- [Appendix A — Formula sheet](#appendix-a--formula-sheet)
+- [Appendix B — Output schema](#appendix-b--output-schema)
+- [Appendix C — Failure classes](#appendix-c--failure-classes)
 
 ---
 
-## 3. Scientific objective
+## 1. Scope and release status
 
-The model state is
+HumidClimatologyEngine is a research-grade workflow for constructing **day-resolved moisture climatology from ERA5-Land hourly fields**.
 
-$$
-X =
-\begin{bmatrix}
-T\\
-T_d\\
-\ln P
-\end{bmatrix}.
-$$
+The principal production period is:
 
-For a given climatological day and grid cell, the intended statistical representation is
+```text
+Target climatology: 1981-01-01 through 2020-12-31
+Climatological slots: 366
+Primary frequency: hourly
+Primary variables: t2m, d2m, sp
+```
 
-$$
-X \sim \mathcal{N}(\mu,\Sigma),
-$$
+The production philosophy is **empirical first**:
 
-subject to empirical diagnostics, covariance validity checks, and the limitations of the Gaussian assumption.
+```text
+ERA5-Land hourly T2m + D2m + SP
+        |
+        v
+exact timestamp alignment + physical validity
+        |
+        v
+RH / e / r / q for every valid hourly state
+        |
+        +----------------------+
+        |                      |
+        v                      v
+empirical moments       empirical 2-D probability
+(DOY x cell)            (DOY x cell x pair)
+        |
+        v
+optional 5-day centred distribution-model layer
+        |
+        v
+Normal / Skew-Normal / Pearson III / Beta /
+Bimodal Normal / copula candidates
+        |
+        v
+selection + diagnostics + visual dominance report
+```
 
-The transformed pressure variable is used to represent multiplicative pressure variability more naturally and to guarantee positive pressure after exponentiation.
+### Current implementation status
 
-The model is **not** a claim that the real atmosphere is Gaussian. It is a tractable local approximation whose adequacy must be validated against the intended scientific use.
+| Capability | v7.5 code status | Scientific role |
+|---|---|---|
+| Hourly empirical RH/e/r/q moments | Integrated | Primary production product |
+| Annual disk-backed checkpoints | Integrated | Restart / power-failure protection |
+| Per-DOY spatial completion bitmap | Integrated | Transaction-like progress state |
+| Global progress / remaining units / ETA | Integrated | Operations |
+| Empirical 2-D histogram/PDF | Integrated | Primary joint reference |
+| Bivariate Gaussian evaluator | Integrated | Reference candidate only |
+| 5-day centred extraction | Implemented as fitting/query layer | Distribution fitting |
+| Normal / Skew-Normal / Pearson III / Beta fitting | Implemented in fitting layer | Candidate marginals |
+| Bimodal Normal 5-parameter fitting | Implemented in fitting layer | Candidate multimodal model |
+| Gaussian copula estimator | Implemented in fitting layer | Dependence candidate |
+| Bivariate dominance report generator | Separate tool | Visual QA / reporting |
+| Full automatic 40-year per-cell model selection in `main()` | **Not claimed** | Requires explicit second-pass orchestration |
+
+The last row is deliberate. A production README must describe what the code actually executes, not what a future orchestrator is expected to execute.
 
 ---
 
-## 4. Why joint modeling matters
+## 2. v6 versus v7
 
-Moisture diagnostics are nonlinear functions of the atmospheric state. For example,
+### v6: historical / educational baseline
 
-$$
-RH = 100\,\frac{e_s(T_d)}{e_s(T)},
-$$
-
-while
-
-$$
-r = \frac{\epsilon e}{P-e}, \qquad q = \frac{r}{1+r}.
-$$
-
-Averaging T, Td and P separately and then inserting those means into a nonlinear formula is generally not equivalent to propagating the observed joint distribution through the formula.
-
-The engine therefore follows the order:
-
-```text
-joint atmospheric state
-        ↓
-statistical representation
-        ↓
-Monte Carlo realization
-        ↓
-thermodynamic transformation
-        ↓
-distributional summary
-```
-
-rather than:
-
-```text
-mean T + mean Td + mean P
-        ↓
-one deterministic humidity calculation
-```
-
-This distinction is central to the scientific design.
-
----
-
-## 5. Thermodynamic transformations
-
-### 5.1 Relative humidity
-
-$$
-RH = 100\,\frac{e_s(T_d)}{e_s(T)}.
-$$
-
-The precise saturation-vapor-pressure formulation is part of the model definition and therefore must be preserved with the code/version used for any published result.
-
-### 5.2 Vapor pressure
-
-$$
-e=e_s(T_d).
-$$
-
-### 5.3 Mixing ratio
-
-$$
-r=\frac{0.622e}{P-e}.
-$$
-
-The denominator must remain positive for the intended physical domain.
-
-### 5.4 Specific humidity
-
-$$
-q=\frac{r}{1+r}.
-$$
-
-Because these transformations are nonlinear, distributional shape is expected to change even when the underlying atmospheric state is approximately Gaussian.
-
----
-
-## 6. Calendar convention
-
-The supplied specification uses a **366-slot climatological calendar** with February 28 and February 29 pooled into a single climatological day.
-
-| Slot | Meaning |
-|---:|---|
-| 1–58 | January 1 through February 27 |
-| 59 | Reserved slot in the supplied specification |
-| 60 | February 28 + February 29 composite |
-| 61–366 | March 1 through December 31 |
-
-Operationally:
-
-```text
-Leap year:
-  Feb 28 → 60
-  Feb 29 → 60
-  Mar 01 → 61
-
-Non-leap year:
-  Feb 28 → 60
-  Mar 01 → 61
-```
-
-This convention is **not** the standard one-dimensional day-of-year mapping and therefore must be treated as a formal model contract. Any downstream consumer must use the same mapping.
-
-> **Important:** if a production implementation uses a different slot convention, the implementation is authoritative and this section should be updated to match it exactly before publication.
-
----
-
-## 7. Statistical accumulation
-
-The intended accumulation architecture is online rather than raw-history based.
-
-### Paired-valid sampling
-
-A sample contributes only when all required state variables are simultaneously valid:
-
-```text
-T   finite
-Td  finite
-P   finite
-P   > 0
-```
-
-This is important because a covariance matrix must describe a **single joint population** rather than a set of separately filtered marginals.
-
-### Welford-style online statistics
-
-The design uses numerically stable sufficient-statistic accumulation for counts, means, variances, and covariances. This avoids retaining a full multidecadal sample history just to estimate first- and second-order moments.
-
-### Mergeable states
-
-Year-level states can be merged into climatological states. Conceptually:
-
-```text
-1981 ─┐
-1982 ─┤
-...   ├──→ mergeable sufficient statistics ──→ 1981–2020 climatology
-2020 ─┘
-```
-
-This makes restart and parallel execution much more practical than a monolithic historical array.
-
-### Higher moments
-
-The intended moisture products include:
-
-- mean,
-- sample standard deviation,
-- bias-corrected skewness, and
-- Fisher excess kurtosis.
-
-For publication, the exact estimator definitions and finite-sample behavior should be frozen in a versioned methodology document rather than inferred from variable names alone.
-
----
-
-## 8. Covariance discipline
-
-A covariance matrix is not merely an internal numerical object. It is part of the scientific model.
-
-The intended safeguards are:
-
-1. validate the number of valid paired observations;
-2. inspect covariance conditioning and eigenvalues;
-3. test positive-semidefiniteness within an explicit tolerance;
-4. test Cholesky feasibility where Cholesky factorization is used;
-5. preserve diagnostics when a cell/day is numerically problematic;
-6. **never silently replace an invalid covariance with an unrelated fallback model**.
-
-A silent identity fallback would destroy the empirical dependence structure and produce a numerically convenient but scientifically different model.
-
----
-
-## 9. Monte Carlo architecture
-
-The design explicitly avoids materializing a giant sample cube such as:
-
-```text
-N_SAMPLES × latitude × longitude
-```
-
-for an entire climatological day.
-
-Instead, the intended processing hierarchy is:
-
-```text
-day
-  → cell chunk
-      → sample batch
-          → transform
-              → online moments
-```
-
-The dominant temporary memory footprint therefore depends primarily on:
-
-```text
-CELL_CHUNK_SIZE × SAMPLE_BATCH_SIZE
-```
-
-rather than on the complete global grid.
-
-### Nominal configuration from the supplied specification
-
-```text
-N_SAMPLES          = 5000
-CELL_CHUNK_SIZE    = 1024
-SAMPLE_BATCH_SIZE  = 256
-MAX_WORKERS        = 2
-RANDOM_SEED        = 20260821
-```
-
-These are **configuration values, not scientific truths**. A sample-count sensitivity study should compare at least a low, middle, and high setting and verify that the scientific conclusions are stable.
-
-A useful convergence ladder is:
-
-```text
-500 → 1000 → 2000 → 5000 → 10000
-```
-
-For each level, compare means, spread, skewness, kurtosis, and Monte Carlo standard errors.
-
----
-
-## 10. Monte Carlo uncertainty
-
-For a Monte Carlo mean,
-
-$$
-SE(\bar{x}) \approx \frac{s}{\sqrt{N}},
-$$
-
-where `s` is the realization-level standard deviation and `N` is the number of valid realizations.
-
-This allows the final product to separate two conceptually different quantities:
-
-```text
-physical/statistical variability
-                 vs.
-Monte Carlo sampling error
-```
-
-Representative diagnostics described by the supplied specification are:
-
-```text
-mc_se_mean_rh
-mc_se_mean_e
-mc_se_mean_r
-mc_se_mean_q
-```
-
-A production implementation should also preserve the **valid sample count** associated with each uncertainty estimate.
-
----
-
-## 11. Checkpoint and restart philosophy
-
-Long climate computations fail for ordinary operational reasons: process termination, workstation restarts, filesystem problems, or accidental interruption. Restartability is therefore an engineering requirement, not a luxury.
-
-The supplied specification describes two checkpoint scales.
-
-### Annual checkpoints
+`moisture_climatology_v6.py` is intentionally retained. Its input contract is based on **daily statistics**, followed by a joint statistical representation of `(T, Td, ln P)` and Monte-Carlo propagation.
 
 Conceptually:
 
 ```text
-year_YYYY_<config_hash>.*
+hourly source
+   |
+   v
+DAILY AGGREGATION
+   |
+   v
+statistics of (T, Td, ln P)
+   |
+   v
+joint Gaussian approximation
+   |
+   v
+Monte Carlo
+   |
+   v
+RH / e / r / q
 ```
 
-with metadata such as:
+This is valuable for teaching and benchmarking:
 
-- year,
-- schema version,
-- grid shape,
-- configuration hash,
-- checksum,
-- creation metadata.
+- paired multivariate statistics;
+- covariance construction;
+- positive-semidefinite checks;
+- Cholesky factorization;
+- stochastic propagation;
+- Monte-Carlo sampling error;
+- restartable statistical states.
 
-### Daily Monte Carlo checkpoints
+It is **not** the preferred production method for direct hourly moisture climatology because aggregation occurs before the nonlinear moisture transformations.
 
-Conceptually:
+### v7: production direction
+
+v7 starts from hourly paired observations and transforms the physical state before estimating the moisture distributions:
 
 ```text
-day_DDD_<config_hash>.*
+hourly T2m + D2m + SP
+        |
+        v
+thermodynamics
+        |
+        v
+RH / e / r / q
+        |
+        v
+empirical statistics + empirical joint probability
 ```
 
-This permits a long climatological run to restart from its last valid daily state.
+This preserves much more of the observed hourly structure and avoids making a Gaussian reconstruction the primary definition of the moisture distribution.
 
-### Atomicity
+### Why v6 is not deleted
 
-A robust checkpoint sequence is:
+v6 remains part of the scientific history of the project. It should be cited as:
 
-```text
-compute
-  ↓
-write temporary artifact
-  ↓
-flush / synchronize
-  ↓
-atomic replacement
-  ↓
-write/verify metadata and checksum
-```
+> **Historical / educational daily-statistical Gaussian-Monte-Carlo baseline.**
 
-A checkpoint that is incomplete or incompatible must be treated as invalid rather than reused.
+The project should not silently rewrite history by deleting it.
 
 ---
 
-## 12. Reproducibility contract
+## 3. Scientific data flow
 
-A scientifically reproducible result requires more than a software version.
+The production pipeline has two distinct layers.
 
-Preserve at minimum:
+### Layer A — primary climatology
 
 ```text
-software version / commit
-configuration hash
-source checksum
-input-data version
-preprocessing recipe
-random seed
-sample count
-calendar convention
-statistical estimator definitions
-environment versions
-final output checksum
+files
+  -> timestamp validation
+  -> grid validation
+  -> unit normalization
+  -> climatological-day mapping
+  -> hourly physical transformation
+  -> Welford/Pébay accumulation
+  -> annual checkpoint
+  -> multi-year merge
+  -> NetCDF climatology
 ```
 
-For publication, the acquisition recipe for ERA5-Land should also be preserved when the raw data cannot legally or practically be redistributed.
+### Layer B — probability modelling
+
+```text
+5-day centred hourly sample
+  -> valid paired sample
+  -> candidate marginal fits
+  -> candidate dependence fits
+  -> diagnostics
+  -> model ranking
+  -> frozen selection result
+  -> bivariate dominance report
+```
+
+The layers are intentionally separated so that the empirical climatology remains valid even if a particular parametric distribution later proves inadequate.
 
 ---
 
-## 13. ERA5-Land input contract
+## 4. ERA5-Land input contract
 
-The intended input variables are:
+### Required variables
 
-| Physical quantity | Typical ERA5-Land name | Role |
+| Variable | ERA5-Land field | Internal meaning |
 |---|---|---|
 | 2 m air temperature | `t2m` | T |
 | 2 m dew-point temperature | `d2m` | Td |
 | Surface pressure | `sp` | P |
 
-The scientific pipeline assumes daily fields or a precisely documented daily aggregation from a higher-frequency source.
+Typical ERA5-Land source units are Kelvin for `t2m`/`d2m` and Pascal for `sp`; the engine converts them to degrees Celsius and hPa before thermodynamic calculations.
 
-Before production, validate:
+### Timestamp is authoritative
 
-- units,
-- time coverage,
-- time monotonicity,
-- latitude ordering,
-- longitude convention,
-- grid compatibility,
-- missing-value semantics,
-- variable naming,
-- monthly completeness.
+The loader must use the **actual datetime coordinate inside the NetCDF**, not the filename, not an assumed hour sequence, and not an inferred DOY.
 
-The rule should be **fail closed**: reject ambiguous or inconsistent inputs instead of guessing.
+The current input layer accepts `valid_time` first and can fall back to `time`. This matters because edge files can have a structure such as:
+
+```text
+Dimensions:
+    valid_time = 48
+    latitude   = 301
+    longitude  = 301
+
+Coordinates:
+    valid_time = datetime64[ns]
+    latitude   = 50.0 ... 20.0
+    longitude  = 35.0 ... 65.0
+
+Data variables:
+    d2m(valid_time, latitude, longitude)
+    t2m(valid_time, latitude, longitude)
+```
+
+### Grid contract
+
+Before scientific processing, the three variables must be checked for:
+
+- latitude existence and ordering;
+- longitude existence and ordering;
+- matching coordinate values;
+- matching dimensions;
+- matching timestamps;
+- unit metadata;
+- finite / missing-value semantics.
+
+A mismatch must fail closed rather than silently regrid or guess.
 
 ---
 
-## 14. Data-model requirements for production
+## 5. Time indexing and the 5-day centred window
 
-Every input dataset should have an explicit data contract covering:
+### Window definition
 
-```text
-dimensions
-coordinates
-units
-valid range
-missing-value convention
-calendar/time zone convention
-spatial reference
-aggregation definition
-source provenance
-```
-
-A useful preflight report should answer, before expensive computation begins:
+For a target date `D`, the fitting window is:
 
 ```text
-What files will be read?
-What exact dates do they cover?
-Are the three variables on identical grids?
-Are units compatible with the physics layer?
-How many observations are expected?
-Are any months missing or duplicated?
+D-2, D-1, D, D+1, D+2
 ```
 
-The cost of this preflight is negligible compared with the cost of discovering an input problem after many hours of Monte Carlo execution.
+Using hourly data, a complete five-day window spans:
+
+```text
+D-2 00:00  ->  D+2 23:00
+```
+
+which corresponds to **120 hourly timestamps** before missing-value filtering.
+
+The target day remains the statistical label. The surrounding four days are padding used to stabilise the local distribution fit.
+
+### Why the window is applied before fitting
+
+The window must be extracted from the raw hourly series. Applying a five-day window after a DOY summary would destroy the temporal information needed by Pearson III, Skew-Normal, Bimodal Normal, Beta, and copula fitting.
+
+Correct:
+
+```text
+raw hourly series
+   -> centred 5-day extraction
+   -> distribution fit
+```
+
+Incorrect:
+
+```text
+hourly
+   -> daily/DOY summary
+   -> 5-day averaging of summaries
+   -> distribution fit
+```
+
+### Boundary padding
+
+The target period is 1981–2020.
+
+Additional files outside the target period are used only as temporal padding.
+
+For the beginning of the record, the supplied edge file is:
+
+```text
+K:\kazemi\papers\temperature_interpolation\19801230-19801231.nc
+```
+
+This file supplies 1980-12-30 and 1980-12-31 for the first complete 1981 windows.
+
+At the other end, data are available through 2021-06, which is more than sufficient to complete the final 2020 centred windows.
+
+Padding observations are **not** counted as climatology years outside 1981–2020. They exist only to complete local fitting windows.
+
+### Window completeness metadata
+
+Every fitting query should retain:
+
+```text
+window_days_requested
+window_days_available
+window_completeness_fraction
+paired_observation_count
+first_timestamp
+last_timestamp
+```
+
+A complete window is expected to have five calendar days and up to 120 hourly timestamps per variable before validity filtering.
 
 ---
 
-## 15. Output contract
+## 6. Climatological calendar
 
-The intended main product is a NetCDF climatology such as:
+The production calendar has 366 slots.
+
+| Slot | Meaning |
+|---:|---|
+| 1–58 | January 1 through February 27 |
+| 59 | Reserved |
+| 60 | February 28 + February 29 composite |
+| 61–366 | March 1 through December 31 |
+
+Operational mapping:
 
 ```text
-moisture_climatology_1981_2020.nc
+Leap year:
+  Feb 28 -> 60
+  Feb 29 -> 60
+  Mar 01 -> 61
+
+Non-leap year:
+  Feb 28 -> 60
+  Mar 01 -> 61
 ```
 
-Representative fields are:
+Slot 59 is reserved. The February 28/29 pooling is a formal model decision and must be preserved by downstream tools.
 
-### Relative humidity
+---
+
+## 7. Thermodynamic calculations
+
+The engine works internally with:
 
 ```text
-mean_rh
-std_rh
-skew_rh
-kurt_rh
+T_C  = T_K  - 273.15
+Td_C = Td_K - 273.15
+P_hPa = P_Pa / 100
+```
+
+### Saturation vapor pressure
+
+For `T >= 0 °C`:
+
+```text
+es(T) = 6.112 * exp(17.67*T / (T + 243.5))
+```
+
+For `T < 0 °C`:
+
+```text
+es(T) = 6.112 * exp(22.46*T / (T + 272.62))
 ```
 
 ### Vapor pressure
 
 ```text
-mean_vapor_pressure
-std_vapor_pressure
-skew_vapor_pressure
-kurt_vapor_pressure
+e = es(Td)
 ```
+
+### Relative humidity
+
+```text
+RH_raw = 100 * es(Td) / es(T)
+```
+
+The reported RH is bounded to `[0, 100]`. Supersaturation is counted separately rather than being hidden.
 
 ### Mixing ratio
 
 ```text
-mean_mixing_ratio
-std_mixing_ratio
-skew_mixing_ratio
-kurt_mixing_ratio
+r = 0.622 * e / (P - e)
 ```
+
+Only physically valid states with:
+
+```text
+e > 0
+P > 0
+e < P
+```
+
+are allowed into the `r` / `q` empirical sample.
 
 ### Specific humidity
 
 ```text
-mean_specific_humidity
-std_specific_humidity
-skew_specific_humidity
-kurt_specific_humidity
+q = r / (1 + r)
 ```
 
-A companion diagnostic product should contain enough information to distinguish:
+The project keeps physical validity filtering separate from display clipping. For example, clipping RH to 100% does not make an invalid `e/P` state physically valid.
+
+---
+
+## 8. Empirical moment engine
+
+For each climatological day and spatial cell, the primary production product accumulates:
 
 ```text
-missing input
-bad pressure
-invalid covariance
-invalid transformed state
-insufficient samples
-Monte Carlo uncertainty
+n
+mean
+M2
+M3
+M4
 ```
 
-from one another.
-
----
-
-## 16. Recommended metadata
-
-A publication-grade NetCDF should preserve metadata such as:
+for:
 
 ```text
-title
-summary
-institution
-source
-references
-Conventions
-history
-creation_time
-software_name
-software_version
-git_commit
-configuration_hash
-input_data_identifier
-calendar_convention
-random_seed
-mc_samples
+RH
+e
+r
+q
 ```
 
-Variables should also carry:
+The update strategy is Welford/Pébay-style online accumulation. It is numerically stable, mergeable, and does not require retaining the entire multidecadal sample history.
+
+### Final estimators
+
+For `n >= 2`:
 
 ```text
-long_name
-units
-standard_name (where applicable)
-valid_min / valid_max (where meaningful)
+sample variance = M2 / (n - 1)
+sample std      = sqrt(sample variance)
 ```
 
-The metadata should describe the **actual executed configuration**, not merely the default configuration in a README.
+The production finalization additionally derives:
+
+- mean;
+- sample standard deviation;
+- bias-corrected skewness;
+- Fisher excess kurtosis.
+
+### Mergeability
+
+Annual states can be merged into the 1981–2020 multi-year state without replaying the original hourly archive.
+
+This is central to both parallel processing and restartability.
 
 ---
 
-## 17. Validation hierarchy
+## 9. Two-dimensional probability framework
 
-The intended validation strategy should proceed from the smallest scientific unit to the complete product.
+The bivariate layer is deliberately **not locked to a bivariate normal distribution**.
 
-### Level 1 — scalar physics reference
+### Primary joint product: empirical 2-D probability
 
-Test the thermodynamic equations against an independent scalar implementation.
+The primary joint distribution is built directly from hourly paired observations.
 
-### Level 2 — vectorized physics
+For the current production configuration:
 
-Confirm that batch/vector results match the scalar reference within an explicitly chosen numerical tolerance.
+```text
+pair = (RH, q)
+bins = 8 x 8
+```
 
-### Level 3 — statistics
+The stored grid counts are normalised by sample count and bin area to produce a piecewise-constant density.
 
-Compare online estimators with a trusted offline reference on small synthetic samples.
+Therefore the primary object is:
 
-### Level 4 — covariance
+```text
+p_empirical(x, y | DOY, grid cell)
+```
 
-Check symmetry, eigenvalues, Cholesky behavior, and pathological small-sample cases.
+rather than:
 
-### Level 5 — Monte Carlo
+```text
+p_gaussian(x, y | DOY, grid cell)
+```
 
-Demonstrate convergence with increasing `N_SAMPLES` and verify deterministic behavior for fixed seeds.
+### Reference Gaussian evaluator
 
-### Level 6 — checkpoint/restart
+A vectorized bivariate Gaussian PDF evaluator exists because it is useful as a comparison baseline:
 
-Run a small job, interrupt it, resume it, and verify that the restarted output matches the uninterrupted reference to the declared tolerance.
+```text
+bivariate_gaussian_pdf(
+    x, y,
+    mean_x, std_x,
+    mean_y, std_y,
+    rho
+)
+```
 
-### Level 7 — final NetCDF
+This evaluator is **not** the definition of the empirical joint distribution.
 
-Verify dimensions, coordinates, units, finite-value behavior, physical bounds, diagnostic completeness, and checksums.
+### Why empirical first
 
-The key idea is **validation before scale**.
+The actual moisture distribution may be:
+
+- skewed;
+- heavy-tailed;
+- bounded;
+- multimodal;
+- regime-dependent;
+- asymmetric in its dependence structure.
+
+A single Gaussian surface cannot be assumed to reproduce all of those features.
 
 ---
 
-## 18. Physical plausibility checks
+## 10. Candidate univariate distributions
 
-The transformation layer should monitor at least:
+The 5-day fitting layer evaluates candidate distributions per target date and local series.
 
-- negative or non-positive pressure,
-- non-finite saturation-vapor-pressure results,
-- `e >= P` for the mixing-ratio denominator,
-- non-finite transformed outputs,
-- suspicious RH excursions,
-- unexpectedly extreme transformed tails.
+### Normal
 
-A failed physical check should be classified and counted rather than hidden in a generic `NaN` bucket.
+Useful as a transparent baseline and as a reference for improvement metrics.
+
+### Skew-Normal
+
+Useful when a single dominant regime has asymmetric shape.
+
+The implementation retains two auditable variants:
+
+1. **ClimateProcessingEngine-style moment parameterisation** using sample mean, standard deviation and sample skewness;
+2. **SciPy maximum-likelihood fit**.
+
+Both can be compared by the same likelihood information criteria.
+
+### Pearson Type III
+
+Pearson III is included because it can reproduce skewed continuous distributions and performed well for temperature in the companion `ClimateProcessingEngine` workflow.
+
+It should be evaluated rather than assumed optimal for moisture variables.
+
+### Beta
+
+Beta is a candidate only when the variable is naturally bounded on `[0, 1]`.
+
+Examples:
+
+```text
+RH_fraction = RH / 100
+q           in [0, 1]
+```
+
+Endpoint handling requires care because ordinary Beta support is open at the boundaries. The current fitting layer uses a small epsilon transformation before fitting.
+
+### Bimodal Normal
+
+The two-component Gaussian mixture is included as a five-parameter model and is documented separately below.
+
+### Selection principle
+
+No family is declared universally correct.
+
+The fitting layer returns the full candidate table so that the winning family and the alternatives remain auditable.
 
 ---
 
-## 19. Performance philosophy
+## 11. Bimodal Normal: five-parameter model
 
-The correct optimization target is not “fastest possible run.” It is:
+The project uses a **two-component Gaussian mixture**, not a two-piece normal distribution.
+
+The five independent parameters are:
+
+```text
+w1
+mu1
+sigma1
+mu2
+sigma2
+```
+
+with:
+
+```text
+w2 = 1 - w1
+```
+
+### Fitting method
+
+The current implementation uses an EM-style `GaussianMixture` fit with:
+
+```text
+n_components = 2
+n_init       = 10
+max_iter     = 1000
+tol          = 1e-4
+reg_covar    = 1e-6
+random_state = 20260821
+```
+
+Components are sorted by mean after fitting so that:
+
+```text
+mu1 <= mu2
+```
+
+This makes stored parameters stable and interpretable.
+
+### Retained diagnostics
+
+The fit records:
+
+- log-likelihood;
+- AIC;
+- AICc;
+- BIC;
+- component weights;
+- component means;
+- component standard deviations;
+- separation metric comparable to Ashman-type separation;
+- overlap coefficient;
+- EM configuration.
+
+### Scientific use
+
+Bimodal Normal is valuable when a local distribution contains two distinct regimes. It must not be used merely because it has five parameters and a lower raw likelihood; model complexity is explicitly penalised by AICc/BIC and should also be reviewed with multimodality diagnostics.
+
+---
+
+## 12. Copula and dependence layer
+
+The joint distribution is separated into two conceptual parts:
+
+```text
+marginal distributions
+        +
+dependence model
+        =
+joint distribution
+```
+
+### Pseudo-observations
+
+The fitting layer converts each marginal to rank-based pseudo-observations:
+
+```text
+u = (rank(x) - 0.5) / n
+v = (rank(y) - 0.5) / n
+```
+
+The Gaussian copula transform then uses the inverse standard normal transformation:
+
+```text
+z_x = Phi^-1(u)
+z_y = Phi^-1(v)
+```
+
+and estimates dependence from the resulting transformed ranks.
+
+### Current copula status
+
+The current fitting layer contains a Gaussian copula estimator. It is a **candidate dependence model**, not a scientific axiom.
+
+Future candidate families may include:
+
+- t-copula;
+- tail-dependent Archimedean copulas;
+- empirical copula;
+- other copulas selected by diagnostic performance.
+
+### Important distinction
+
+The existence of a copula fit does **not** mean the marginal distributions are Gaussian. For example:
+
+```text
+RH   -> Beta
+q    -> Beta
+dependence -> Gaussian copula
+```
+
+is a legitimate joint model.
+
+Likewise:
+
+```text
+RH   -> Bimodal Normal
+q    -> Pearson III
+dependence -> copula
+```
+
+can be evaluated if scientifically justified.
+
+---
+
+## 13. Model fitting and selection
+
+### Minimum sample size
+
+The fitting layer uses:
+
+```text
+FIT_MIN_OBS = 30
+```
+
+for the candidate distribution fits.
+
+This is an estimability guard, not a universal statistical truth. A future publication should report sensitivity to the minimum-sample threshold.
+
+### Information criteria
+
+For `k` fitted parameters and `n` observations:
+
+```text
+AIC  = 2k - 2 logL
+BIC  = k log(n) - 2 logL
+AICc = AIC + 2k(k+1) / (n-k-1)
+```
+
+The current selection order is:
+
+```text
+minimum AICc
+        -> tie-break by BIC
+```
+
+The complete candidate table remains available for audit.
+
+### What should be added before publication-scale model selection
+
+A production release should augment the information criteria with:
+
+- independent goodness-of-fit diagnostics;
+- tail diagnostics;
+- parameter stability checks;
+- multimodality diagnostics;
+- sensitivity to the 5-day window;
+- sensitivity to minimum sample count.
+
+That prevents a purely information-criterion-driven choice from being mistaken for proof of physical adequacy.
+
+---
+
+## 14. Spatial chunking and station/grid-cell extraction
+
+The production accumulation engine uses spatial chunks:
+
+```text
+CHUNK_LAT = 32
+CHUNK_LON = 64
+```
+
+The processing hierarchy is therefore approximately:
+
+```text
+year
+  -> month
+     -> climatological DOY slot
+        -> latitude chunk
+           -> longitude chunk
+              -> hourly slices
+                 -> moisture transformation
+                 -> online accumulation
+```
+
+### Why this matters
+
+Loading an entire regional 40-year hourly archive into memory is unnecessary and unsafe.
+
+The chunk strategy bounds the number of grid cells resident in the working arrays and permits deterministic checkpointing at a much finer granularity.
+
+### Station / grid-cell query
+
+The 5-day fitting layer is designed to extract only the requested grid point or station-nearest cell and its required time window.
+
+The extraction logic:
+
+```text
+requested date + coordinate
+        |
+        v
+identify spatial block / cell
+        |
+        v
+read only intersecting input files
+        |
+        v
+use actual time coordinate
+        |
+        v
+select D-2 ... D+2
+        |
+        v
+align T2m / D2m / SP by exact timestamp
+```
+
+This avoids reopening the complete regional grid for every local model fit.
+
+### Edge-file handling
+
+The special 1980-12-30/31 combined T2m+D2m file is explicitly supported by the fitting/query layer because it is the supplied source for the initial 1981 centered windows.
+
+---
+
+## 15. Checkpoints and power-failure recovery
+
+Power-loss recovery is a **scientific requirement**, not merely a convenience.
+
+### Checkpoint unit
+
+The annual checkpoint stores a completion flag for every:
+
+```text
+DOY × latitude-chunk × longitude-chunk
+```
+
+This is substantially finer than a year-level flag.
+
+### Transaction order
+
+For every spatial chunk:
+
+```text
+1. read hourly slices
+2. calculate moisture
+3. update sufficient statistics
+4. write chunk into checkpoint
+5. ds.sync()
+6. mark completed_chunk = 1
+7. ds.sync()
+8. update progress JSON atomically
+```
+
+The completion flag is therefore written **after** the statistical state has been persisted.
+
+### What happens after a power failure
+
+If power is lost after a chunk is written but before its completion flag is committed, the chunk is recomputed.
+
+If the completion flag is already committed, the chunk is skipped on restart.
+
+Thus a failure does not invalidate the whole year.
+
+### Checkpoint compatibility
+
+A checkpoint is reusable only when its:
+
+- schema version;
+- configuration hash;
+- grid shape;
+- chunk shape;
+- variable contract
+
+match the current run.
+
+### Progress state
+
+A companion JSON record stores:
+
+```text
+completed_units
+total_units
+remaining_units
+progress_percent
+last_completed_doy
+updated_utc
+configuration hash
+```
+
+This JSON is written atomically.
+
+---
+
+## 16. Progress reporting and ETA
+
+The engine explicitly reports progress at both the **year level** and **global run level**.
+
+Example pattern:
+
+```text
+PROGRESS | Year 1987 | DOY 173 chunks 31/40 | 77.50% | 31/40 units | remaining 9 | rate 0.84 units/s | ETA 0.00 h
+```
+
+Global messages report:
+
+```text
+GLOBAL PROGRESS | 64.28% | 12345/19200 units | remaining 6855 | active years 2
+```
+
+At the end of accumulation:
+
+```text
+ACCUMULATION COMPLETE | 100.00% | ... | remaining 0
+```
+
+The quantities are explicit:
+
+- percentage complete;
+- completed units;
+- total units;
+- remaining units;
+- processing rate;
+- ETA where it is estimable;
+- active/completed years.
+
+This is designed for long unattended runs and for transparent postmortem analysis after an interruption.
+
+---
+
+## 17. Production outputs
+
+### Main climatology
+
+```text
+moisture_climatology_1981_2020_v7_5.nc
+```
+
+Conceptual dimensions:
+
+```text
+doy x latitude x longitude
+```
+
+Primary variables:
+
+```text
+mean_rh   std_rh   skew_rh   kurt_rh
+mean_e    std_e    skew_e    kurt_e
+mean_r    std_r    skew_r    kurt_r
+mean_q    std_q    skew_q    kurt_q
+```
+
+### Diagnostics
+
+```text
+moisture_climatology_diagnostics_1981_2020_v7_5.nc
+```
+
+Important diagnostics include:
+
+```text
+n_obs
+supersaturation_fraction
+invalid_e_over_p_fraction
+```
+
+### Bivariate reference parameters
+
+```text
+moisture_climatology_bivariate_1981_2020_v7_5.nc
+```
+
+The current default pair is:
+
+```text
+(RH, q)
+```
+
+The stored reference state includes per-DOY/per-cell paired count, means, covariance, and correlation.
+
+### Empirical bivariate PDFs
+
+For fixed-range pairs, the engine can build a separate empirical 2-D product:
+
+```text
+moisture_bivariate_empirical_RH__q_1981_2020_v7_5.nc
+```
+
+The current default configuration uses an `8 x 8` histogram grid for this empirical surface.
+
+### Run manifest
+
+```text
+moisture_climatology_run_manifest_v7_5.json
+```
+
+The manifest records configuration, source hash, output paths, and hashes of generated products where available.
+
+---
+
+## 18. Bivariate dominance report
+
+The separate tool:
+
+```text
+bivariate_dominance_report.py
+```
+
+turns a frozen model-selection product into a visual report.
+
+### Expected selection input
+
+```text
+best_model_code(doy, latitude, longitude)
+```
+
+plus a global mapping:
+
+```json
+{"1":"Empirical-2D","2":"Gaussian-Copula","3":"t-Copula","4":"Beta-Copula","5":"Bimodal-Copula"}
+```
+
+The reporting tool is intentionally distribution-agnostic. It does not refit models and does not assume Gaussian copulas.
+
+### Report products
+
+It generates:
+
+1. model legend and provenance page;
+2. monthly model-dominance shares;
+3. DOY-by-model spatial occurrence heatmap;
+4. monthly spatial maps of the winning model;
+5. PNG files for publication / QA use;
+6. a combined PDF report.
+
+### Scientific questions answered
+
+**Monthly dominance:**
+
+> Which bivariate model families dominate during each month?
+
+**DOY heatmap:**
+
+> On which climatological days does each model dominate across the domain?
+
+**Spatial maps:**
+
+> Where does each bivariate model family dominate during a given month?
+
+### Separation of responsibilities
+
+```text
+fitting engine
+    |
+    v
+best_model_code
+    |
+    v
+bivariate_dominance_report.py
+    |
+    +--> PDF
+    +--> PNG maps
+    +--> monthly shares
+    +--> DOY heatmap
+```
+
+The report generator must remain deterministic and must not alter the model-selection result.
+
+---
+
+## 19. Provenance and reproducibility
+
+A publication-grade run should archive at least:
+
+```text
+software filename/version
+schema version
+configuration hash
+source SHA-256
+input inventory
+input SHA-256 where practical
+calendar convention
+window definition
+model-fitting configuration
+random seed(s)
+Python version
+NumPy version
+SciPy version
+scikit-learn version where used
+xarray version
+netCDF4 version
+checkpoint hashes
+final NetCDF hashes
+validation log
+report-generator version/hash
+```
+
+### Run manifest principle
+
+The README describes defaults. The **executed run manifest is authoritative**.
+
+A publication must never copy configuration values from documentation when the exact values can be recovered from the run manifest.
+
+### Reproducibility claim
+
+“Same seed” alone is not sufficient to claim bit-for-bit reproducibility across arbitrary parallel execution. Reduction order, library versions, and floating-point behavior must also be controlled or the tolerance must be explicitly declared.
+
+---
+
+## 20. Validation and QA
+
+The validation hierarchy is:
+
+### Level 1 — calendar
+
+Test leap and non-leap mappings, including the reserved slot.
+
+### Level 2 — scalar physics
+
+Compare the implemented saturation and moisture formulae against an independent scalar reference.
+
+### Level 3 — vectorized physics
+
+Verify numerical equivalence between scalar and vector implementations within an explicit tolerance.
+
+### Level 4 — moments
+
+Compare Welford/Pébay online estimates with trusted NumPy/SciPy batch estimates.
+
+### Level 5 — merge
+
+Verify that:
+
+```text
+accumulate(A) + accumulate(B)
+```
+
+and:
+
+```text
+accumulate(A + B)
+```
+
+agree to the declared numerical tolerance.
+
+### Level 6 — bivariate empirical PDF
+
+Verify that:
+
+```text
+sum(bin_counts) = valid_pair_count
+```
+
+and that integrated piecewise density is one within numerical tolerance.
+
+### Level 7 — distribution fitting
+
+Use synthetic distributions with known shape, skewness, and multimodality. Confirm that the candidate fitting layer behaves as expected.
+
+### Level 8 — restart
+
+Run a small case, interrupt it, restart it, and compare against uninterrupted execution.
+
+### Level 9 — serialization
+
+Verify dimensions, coordinates, units, fill values, metadata, and checksums.
+
+### Level 10 — report
+
+Verify that the dominance report uses only the frozen selection array and that all model codes are mapped correctly.
+
+---
+
+## 21. Performance and memory
+
+The primary optimisation goal is:
 
 > **minimum wall-clock time subject to numerical correctness, memory stability, and reproducibility.**
 
-The main tuning controls are:
+### Current controls
 
 ```text
-MAX_WORKERS
-CELL_CHUNK_SIZE
-SAMPLE_BATCH_SIZE
-N_SAMPLES
+MAX_WORKERS = 2
+CHUNK_LAT   = 32
+CHUNK_LON   = 64
+PROGRESS_FLUSH_CHUNKS = 16
+PROGRESS_LOG_EVERY_CHUNKS = 8
 ```
 
-Tune one at a time and benchmark on representative days/cells.
+### Tuning order
 
-On Windows, process-based parallelism may increase memory pressure because workers can have substantial independent state. More workers are therefore not automatically faster.
+When memory is constrained:
+
+1. reduce spatial chunk size;
+2. reduce worker count;
+3. verify hidden dtype copies;
+4. inspect I/O and serialization;
+5. only then consider changing other scientific settings.
+
+Operational settings must never silently change the scientific model.
 
 ---
 
-## 20. Reset utility
+## 22. Known limitations and explicit non-claims
 
-The archive includes `moisture_climatology_reset.py`, which removes only these explicitly allowed artifacts:
+### The empirical histogram is resolution-dependent
 
-```text
-checkpoints_moisture_v6/
-moisture_climatology_1981_2020.nc
-moisture_climatology_diagnostics_1981_2020.nc
-```
+An `8 x 8` grid is a practical reference surface, not a universal optimal bandwidth choice. Histogram sensitivity should be tested before publication.
 
-### Preview
+### The bivariate Gaussian is not the truth
 
-```bash
-python moisture_climatology_reset.py --dry-run
-```
+It is a reference evaluator only.
 
-### Interactive delete
+### Current copula layer is not a complete universal copula search
 
-```bash
-python moisture_climatology_reset.py
-```
+The current fitting layer contains a Gaussian copula estimator. A publication-scale comparison should add and benchmark other dependence families where tail dependence or asymmetry is scientifically important.
 
-### Non-interactive delete
+### Candidate selection is not the same as physical validation
 
-```bash
-python moisture_climatology_reset.py --yes
-```
+A lower AICc or BIC does not prove physical truth. It identifies a better statistical compromise under the candidate set and sampling assumptions.
 
-### Alternate working directory
+### Five-day window is a modelling choice
 
-```bash
-python moisture_climatology_reset.py --base C:\\c --yes
-```
+The centred `±2 day` window is intended to stabilise local distribution fitting while preserving seasonal locality. It should be sensitivity-tested against alternative window widths for publication-critical results.
 
-### Why this is safer than the original reset script
+### Endpoint behaviour of Beta is special
 
-The original utility contained duplicated deletion logic. The upgraded version centralizes the target allow-list and adds:
+RH can contain exact 0 or 100% values. Standard Beta fitting requires careful endpoint handling; the current layer uses an epsilon transformation. A zero/one-inflated model is a future extension where endpoint mass is scientifically important.
 
-- no implicit deletion outside the selected base directory,
-- dry-run support,
-- explicit confirmation unless `--yes` is provided,
-- symlink-safe handling,
-- structured exit codes,
-- clearer operational messages.
+### Padding is not climatology
 
-The utility is intentionally **destructive only for the exact three named artifacts**. It does not recursively clean arbitrary files from the working directory.
+1980 and 2021 data used for window completion are not additional climatology years.
+
+### Full model-selection orchestration is a separate pass
+
+The current v7.5 `main()` builds the empirical climatology and empirical bivariate products. The five-day distribution/coplanula layer is exposed as fitting functions and extraction utilities; it should be orchestrated as a controlled second pass before claiming a full 40-year, every-cell, every-DOY candidate-selection product.
 
 ---
 
-## 21. Production operating procedure
+## 23. Repository / release layout
 
-A robust production run should follow this order:
-
-```text
-1. Freeze the software version
-2. Freeze the configuration
-3. Validate input inventories
-4. Validate units and coordinates
-5. Run scalar/reference physics tests
-6. Run a small synthetic smoke test
-7. Run a small real-data pilot
-8. Inspect covariance diagnostics
-9. Establish Monte Carlo convergence
-10. Start full climatology
-11. Preserve checkpoints
-12. Validate final NetCDF
-13. Archive checksums and provenance
-```
-
-Never jump directly from “the code starts” to “the climatology is publishable.”
-
----
-
-## 22. Publication-grade reproducibility bundle
-
-A strong release should contain, at minimum:
-
-```text
-software source
-configuration
-input-data identifier
-preprocessing recipe
-environment lock / package versions
-validation report
-main NetCDF
-diagnostic NetCDF
-checksums
-methodology document
-release tag / commit
-```
-
-If the raw ERA5-Land files cannot be redistributed, publish their acquisition instructions and immutable identifiers/checksums instead.
-
----
-
-## 23. Scientific limitations
-
-### Gaussian state model
-
-A multivariate normal model may not represent skewness, multimodality, tails, or regime mixtures adequately. This is especially important for extremes.
-
-### Reanalysis uncertainty
-
-ERA5-Land is a model/reanalysis product; the resulting climatology inherits source-data limitations and does not represent observational truth without qualification.
-
-### Monte Carlo error
-
-Finite `N_SAMPLES` produces sampling uncertainty even when the upstream covariance estimate is exact.
-
-### Thermodynamic formulation
-
-Different saturation-vapor-pressure formulations and unit conversions can produce measurable differences. The exact implementation must therefore be versioned.
-
-### Calendar compression
-
-Pooling February 28 and February 29 is a deliberate modeling choice. It changes the effective climatological calendar and should be documented in publications.
-
-### Independence assumptions
-
-A per-day Monte Carlo state model summarizes the distribution conditional on each climatological day. It does not automatically preserve temporal persistence or event sequencing across days.
-
----
-
-## 24. Recommended sensitivity matrix
-
-For a serious scientific analysis, vary at least:
-
-| Factor | Example levels |
-|---|---|
-| Monte Carlo samples | 500, 1000, 2000, 5000, 10000 |
-| workers | 1, 2, 4 |
-| cell chunk | 512, 1024, 2048 |
-| sample batch | 128, 256, 512 |
-| covariance tolerance | documented low/central/high values |
-| representative regions | dry / humid / cold / warm / mountainous |
-
-The performance factors should be judged on computational behavior; the scientific factors should be judged on output stability.
-
----
-
-## 25. Reproducibility acceptance criteria
-
-A run should be considered reproducible only when:
-
-```text
-same inputs
-+ same configuration
-+ same code
-+ same random seed
-        ↓
-consistent output
-```
-
-within the predeclared numerical tolerance.
-
-For parallel calculations, deterministic results may additionally depend on reduction order and random-stream design. Therefore, “same seed” is not by itself a guarantee of bit-for-bit identity unless the implementation explicitly guarantees it.
-
-This distinction should be stated in any reproducibility claim.
-
----
-
-## 26. Quality gates before publication
-
-Use a signed or versioned release gate such as:
-
-- [ ] input inventory complete;
-- [ ] no duplicate months;
-- [ ] units verified;
-- [ ] coordinates verified;
-- [ ] leap-day mapping confirmed;
-- [ ] scalar physics reference passes;
-- [ ] online statistics agree with an offline reference;
-- [ ] covariance diagnostics acceptable;
-- [ ] Monte Carlo convergence demonstrated;
-- [ ] restart test passes;
-- [ ] NetCDF structure verified;
-- [ ] physical plausibility checks passed;
-- [ ] configuration archived;
-- [ ] source checksum archived;
-- [ ] input-data provenance archived;
-- [ ] final output checksum archived.
-
-A checklist is not a substitute for tests, but it is a powerful final defense against procedural omissions.
-
----
-
-## 27. Minimal verification of the supplied archive
-
-### Syntax check
-
-```bash
-python -m py_compile moisture_climatology_reset.py
-```
-
-### Preview reset behavior
-
-```bash
-python moisture_climatology_reset.py --dry-run
-```
-
-### Inspect the exact target allow-list
-
-```bash
-python -c "import moisture_climatology_reset as m; print(m.TARGETS)"
-```
-
-These checks verify the **artifact that is actually present** in this archive. They do not claim that an absent climatology engine module has been executed.
-
----
-
-## 28. Recommended repository structure for the next full release
-
-The scientific README in the original archive points toward a larger architecture. A robust future repository can formalize it as:
+A publication-oriented repository should contain:
 
 ```text
 HumidClimatologyEngine/
-├── src/humidclimatology/
-│   ├── calendar.py
-│   ├── physics.py
-│   ├── statistics.py
-│   ├── covariance.py
-│   ├── monte_carlo.py
-│   ├── checkpoints.py
-│   ├── io.py
-│   ├── diagnostics.py
-│   ├── validation.py
-│   └── cli.py
-├── tests/
-├── configs/
-├── docs/
-├── examples/
-├── scripts/
-├── pyproject.toml
-├── CITATION.cff
-├── CHANGELOG.md
-├── CONTRIBUTING.md
-├── SECURITY.md
-└── README.md
-```
-
-This is a **recommended target architecture**, not a claim that these files exist in the supplied ZIP.
+|
++-- moisture_climatology_v7_5.py
++-- bivariate_dominance_report.py
++-- moisture_climatology_reset.py
++-- README.md
++-- HumidClimatologyEngine_v7_5_Detailed_Scientific_Engineering_Reference.pdf
++-- HumidClimatologyEngine_v6_vs_v7_5_Detailed_Comparison.pdf
++-- HumidClimatologyEngine_v7_5_Bivariate_Dominance_Report_Documentation.pdf
++|
++ +-- tests/
++ +-- configs/
++ +-- docs/
++ +-- reports/
++ +-- examples/
++ +-- CHANGELOG.md
++ +-- CITATION.cff
++ +-- LICENSE
++```
++
++The tree above is the recommended release layout. Files that are not actually shipped must not be represented as if they already exist in a package archive.
 
 ---
 
-## 29. Engineering principles
-
-The project should preserve these rules as non-negotiable invariants:
-
-> **Fail closed on ambiguous inputs.**
-
-> **Never hide a scientific numerical failure.**
-
-> **Never destroy dependence structure with an unrelated fallback.**
-
-> **Never optimize by changing the model silently.**
-
-> **Never call a result reproducible without preserving the actual configuration.**
-
-> **Never treat a successful process exit as proof of scientific validity.**
-
-These principles are more important than any particular package or implementation detail.
-
----
-
-## 30. Maintainer note
-
-**Maintainer:** Amin Fazlkazemi
-
-Before public release, replace any placeholder repository URLs and ensure the software version, DOI/release identifier, and citation metadata match the exact code used for the published result.
-
----
-
-## License
-
-MIT. See `LICENSE` when the full repository is assembled.
-
----
-
-# 18. Deep Scientific Reference
-
-This section expands the operational README into a reference specification. It is intentionally explicit about what is a model definition, what is a numerical implementation choice, and what is a recommended validation activity.
-
-## 18.1 Scientific contract
-
-The project is best understood as a sequence of deterministic transformations applied to a long atmospheric archive:
-
-```text
-ERA5-Land state variables
-        |
-        +-- acquisition + provenance
-        |
-        +-- unit normalization
-        |
-        +-- climatological-day mapping
-        |
-        +-- paired-valid filtering
-        |
-        +-- online joint-state statistics
-        |
-        +-- annual checkpoint states
-        |
-        +-- mergeable multi-year state
-        |
-        +-- covariance / correlation validation
-        |
-        +-- multivariate Monte Carlo propagation
-        |
-        +-- thermodynamic transformations
-        |
-        +-- higher-moment accumulation
-        |
-        +-- diagnostics + NetCDF serialization
-```
-
-A scientific run should therefore be reproducible not only from the final NetCDF files but from the exact chain of inputs, calendar rules, numerical tolerances, random seed, configuration, software content, and checkpoint lineage that produced them.
-
-## 18.2 Source-of-truth rule
-
-The scientific implementation reference for the project is `moisture_climatology_v6.py`, identified in the project documentation as the main v6 engine. Any wrapper, reset utility, example, README section, or user-facing command should remain subordinate to that implementation. A documentation change must never silently redefine the numerical algorithm.
-
-For release engineering, the safest rule is:
-
-> Change the implementation first, validate it, then regenerate documentation from the validated implementation contract.
-
-This prevents documentation drift, especially when a parameter name, checkpoint schema, default value, or calendar rule changes.
-
-## 18.3 State vector and units
-
-The core state is
-
-$$
-X = (T, T_d, \ln P)^T.
-$$
-
-The working units documented by the project are degrees Celsius for temperature, hectopascals for pressure after conversion, and the natural logarithm of pressure for the third state variable. The expected ERA5-Land source units are Kelvin for temperature and dew point and Pascal for surface pressure.
-
-The transformation is therefore
-
-$$
-T_C = T_K - 273.15,
-$$
-$$
-T_{d,C} = T_{d,K} - 273.15,
-$$
-$$
-P_{hPa} = P_{Pa}/100,
-$$
-$$
-L = \ln(P_{hPa}).
-$$
-
-The explicit pressure-domain transformation is important because the sampler must not generate physically impossible negative surface pressure values.
-
-## 18.4 Paired-valid data rule
-
-An observation enters the joint-state accumulator only when all three state variables are finite and pressure is strictly positive. This rule is stronger than three independent marginal masks. The latter would create mismatched sample sets and corrupt covariance estimates.
-
-For a valid row,
-
-$$
-X_i = \begin{bmatrix}T_i \\ T_{d,i} \\ \ln P_i\end{bmatrix}.
-$$
-
-For $n$ paired-valid states,
-
-$$
-\mu = \frac{1}{n}\sum_{i=1}^{n}X_i,
-$$
-
-and the sample covariance is
-
-$$
-\Sigma = \frac{1}{n-1}\sum_{i=1}^{n}(X_i-\mu)(X_i-\mu)^T.
-$$
-
-The paired-valid count is itself a scientific diagnostic and should be mapped or summarized before interpreting downstream moisture statistics.
-
-## 18.5 Why Welford-style accumulation is the correct engineering choice
-
-The archive can span decades and a large spatial grid. A naive implementation that loads the full record and repeatedly computes sums and sums of squares is both memory-hungry and more vulnerable to cancellation. Online accumulation keeps only sufficient state for the configured statistic order.
-
-For the scalar mean/M2 form:
-
-$$
-\delta = x-\mu,
-$$
-$$
-\mu' = \mu + \delta/n',
-$$
-$$
-M_2' = M_2 + \delta(x-\mu').
-$$
-
-The sample variance is $M_2/(n-1)$ for $n\ge2$.
-
-The project extends the same principle to paired cross-products. This lets annual states be merged without replaying raw observations.
-
-## 18.6 Mergeability
-
-For two states with counts $n_1,n_2$, means $m_1,m_2$, and second-order accumulators $M_{2,1},M_{2,2}$, define
-
-$$
-\delta=m_2-m_1,
-$$
-$$
-n=n_1+n_2,
-$$
-$$
-m=m_1+\delta\frac{n_2}{n}.
-$$
-
-Then
-
-$$
-M_2=M_{2,1}+M_{2,2}+\delta^2\frac{n_1n_2}{n}.
-$$
-
-The covariance cross-term has the compatible correction
-
-$$
-C_{xy}=C_{xy,1}+C_{xy,2}+(m_{x,2}-m_{x,1})(m_{y,2}-m_{y,1})\frac{n_1n_2}{n}.
-$$
-
-This is why annual checkpoint states are scientifically meaningful: they are mergeable sufficient states for the modeled second-order dependence structure.
-
-## 18.7 Climatological calendar contract
-
-The project uses a 366-slot coordinate system with an explicit leap-day convention:
-
-| Calendar date | Gregorian DOY | Climatological slot |
-|---|---:|---:|
-| Feb 28 in leap year | 59 | 60 |
-| Feb 29 in leap year | 60 | 60 |
-| Feb 28 in non-leap year | 59 | 60 |
-| Mar 1 in leap year | 61 | 61 |
-| Mar 1 in non-leap year | 60 | 61 |
-| Mar 2 | 62/61 | 62 |
-
-The practical consequence is that **February 28 and February 29 are deliberately pooled into the same climatological slot**. Slot 59 remains reserved under the project's convention. This is a model decision, not a trivial indexing shortcut.
-
-Any downstream comparison with a conventional 365-day climatology must therefore document its own mapping back to a 365-slot representation.
-
-## 18.8 Thermodynamic layer
-
-The documented water-phase saturation expression is
-
-$$
-e_{s,w}(T)=6.112\exp\left(\frac{17.67T}{T+243.5}\right),
-$$
-
-while the documented ice-phase expression is
-
-$$
-e_{s,i}(T)=6.112\exp\left(\frac{22.46T}{T+272.62}\right).
-$$
-
-The implementation uses water for $T\ge0^\circ C$ and ice for $T<0^\circ C$.
-
-Actual vapor pressure is obtained from dew point:
-
-$$
-e=e_s(T_d).
-$$
-
-Relative humidity is formed as
-
-$$
-RH_{raw}=100\frac{e_s(T_d)}{e_s(T)},
-$$
-
-then bounded to the physical reporting range while the supersaturation fraction is retained as a diagnostic.
-
-The mixing ratio is
-
-$$
-r=\frac{\epsilon e}{P-e},\quad \epsilon=0.622,
-$$
-
-subject to $e>0$, $P>0$, and $e<P$. Specific humidity follows from
-
-$$
-q=\frac{r}{1+r}.
-$$
-
-The distinction between physical validity filtering and display clipping is important: clipping RH to 100% does not make an invalid pressure partition valid.
-
-## 18.9 Joint Gaussian approximation
-
-For each climatological day and grid cell the project represents
-
-$$
-X\sim\mathcal N(\mu,\Sigma).
-$$
-
-The benefit is preservation of dependence between temperature, dew point and log-pressure during stochastic propagation. The cost is a structural assumption that may be weak in multimodal or regime-switching climates.
-
-Potentially vulnerable situations include:
-
-- strongly bimodal synoptic regimes,
-- coastal and mountainous cells with mixed air masses,
-- very cold regimes near phase-transition boundaries,
-- small observational sample sizes,
-- tail-sensitive applications.
-
-For these cases, a Gaussian copula, mixture model, or regime-conditioned model can be evaluated as a sensitivity extension. Such extensions should be treated as alternative methods, not invisible changes to the baseline engine.
-
-## 18.10 Covariance validity and repair policy
-
-A correlation or covariance matrix must be positive semidefinite. Small negative eigenvalues can arise from finite precision, especially after correlation clipping and reconstruction.
-
-The documented policy is to inspect the minimum eigenvalue, allow only a controlled repair window, perform a nearest-correlation style repair where appropriate, and reject a cell/day when the matrix remains invalid. This is scientifically safer than an unconditional jitter that silently changes every matrix.
-
-The three most important audit products are:
-
-1. minimum eigenvalue,
-2. fraction of cells requiring repair or rejection,
-3. spatial distribution of covariance failures.
-
-A modeler should review these maps before accepting the final climatology.
-
-## 18.11 Monte Carlo propagation
-
-Let
-
-$$
-Z\sim\mathcal N(0,I_3),
-$$
-
-and let $L$ be a valid Cholesky factor of the covariance model. Then
-
-$$
-X=\mu+LZ.
-$$
-
-The pressure state is transformed back through
-
-$$
-P=\exp(X_3).
-$$
-
-The engine processes samples in batches and spatial cells in chunks. This avoids allocating the full tensor with dimensions approximately $N_{samples}\times N_{lat}\times N_{lon}$.
-
-The documented production defaults include 5,000 Monte Carlo samples, a cell chunk of 1,024, a sample batch of 256, a conservative two-worker default, and a fixed random seed. These are configuration defaults, not universal scientific constants.
-
-## 18.12 Monte Carlo convergence
-
-For a simple mean under independent sampling,
-
-$$
-SE_{MC}\propto N^{-1/2}.
-$$
-
-The practical implication is that quadrupling the sample count approximately halves idealized mean sampling error, while also increasing computational work by about a factor of four.
-
-A serious release should compare a sequence such as 500, 1,000, 2,000, 5,000, and 10,000 samples. Means usually converge faster than kurtosis; therefore convergence must be evaluated statistic by statistic.
-
-## 18.13 Higher moments
-
-The engine retains more than location and spread. For transformed moisture variables it reports mean, sample standard deviation, bias-corrected skewness, and Fisher excess kurtosis.
-
-The bias-corrected skewness follows the SciPy-style correction described in the project documentation. Fisher excess kurtosis is zero for a Gaussian population, positive for heavier tails, and negative for lighter tails.
-
-Higher moments are much more sample-sensitive than means. A visually stable mean map is not evidence that the fourth moment is stable.
-
-## 18.14 Output contract
-
-The main NetCDF product uses dimensions conceptually equivalent to
-
-```text
-doy × latitude × longitude
-```
-
-and includes the moisture fields:
-
-| Variable family | Statistics |
-|---|---|
-| relative humidity | mean, std, skew, kurtosis |
-| vapor pressure | mean, std, skew, kurtosis |
-| mixing ratio | mean, std, skew, kurtosis |
-| specific humidity | mean, std, skew, kurtosis |
-
-The diagnostic product includes supersaturation fraction, invalid $e/P$ fraction, covariance validity indicators, minimum eigenvalue, valid Monte Carlo sample count, three pairwise correlations, and paired-valid historical observation count.
-
-The documented fill-value convention uses `-9999` where appropriate. Downstream software should honor `_FillValue` metadata rather than interpret that sentinel as a physical value.
-
-## 18.15 Checkpoint and restart contract
-
-The architecture separates three persistence layers:
-
-```text
-annual state
-   ↓ merge
-multi-year state
-   ↓ daily propagation
-transformed moment state
-   ↓ finalize
-NetCDF product
-```
-
-A restart is scientifically valid only when the checkpoint is compatible with the same schema and configuration contract. Required provenance includes the exact source content, configuration, input manifest and hashes, environment specification, checkpoint hashes, final output hashes, validation logs, and Monte Carlo convergence results.
-
-## 18.16 Reproducibility record
-
-A publication-grade run should be reconstructible from a run manifest containing at least:
-
-```yaml
-project: HumidClimatologyEngine
-implementation: moisture_climatology_v6.py
-schema_version: 6.0
-period: 1981-2020
-calendar_slots: 366
-leap_day_policy: pool_feb28_feb29_into_slot_60
-state: [T, Td, lnP]
-random_seed: 20260821
-mc_samples: 5000
-cell_chunk_size: 1024
-sample_batch_size: 256
-max_workers: 2
-input_manifest: SHA256...
-script_sha256: SHA256...
-configuration_hash: SHA256...
-created_utc: 2026-08-22T...
-```
-
-The precise values must be taken from the executed configuration, not copied from an example.
-
-## 18.17 QA release gate
-
-A release candidate should pass all of the following conceptual gates:
-
-| Gate | Acceptance question |
-|---|---|
-| calendar | Do known leap/non-leap dates map exactly to the documented slots? |
-| statistics | Do online and batch statistics agree to numerical tolerance? |
-| covariance | Are symmetry, eigenvalues, and factorization diagnostics valid? |
-| physics | Do independent formula checks reproduce expected values? |
-| Monte Carlo | Does increasing N produce convergent summaries? |
-| restart | Does checkpoint + restart reproduce an uninterrupted run within tolerance? |
-| serialization | Are dimensions, units, fill values, and metadata consistent? |
-| provenance | Are configuration, source, and input hashes archived? |
-| operations | Does the workflow fail loudly on missing or inconsistent inputs? |
-
-## 18.18 Memory engineering
-
-Peak memory is driven primarily by the number of cells in a chunk, the Monte Carlo batch size, and the number of simultaneously resident arrays. The correct tuning direction on a constrained workstation is to reduce chunk or batch size before changing the scientific model.
-
-When RAM pressure is high:
-
-1. decrease `CELL_CHUNK_SIZE`,
-2. decrease `SAMPLE_BATCH_SIZE`,
-3. reduce process concurrency,
-4. avoid hidden copies caused by dtype conversion,
-5. process fewer years per worker only if the checkpoint design supports it.
-
-When CPU utilization is low, inspect I/O waits and serialization before simply increasing worker count. The documented two-worker default is intentionally conservative.
-
-## 18.19 Failure taxonomy
-
-Most failures should fall into one of a small number of recognizable classes:
-
-**Input/provenance failure** - missing files, wrong units, date gaps, duplicate files, or mixed time conventions.
-
-**Calendar failure** - a post-February day shift or inconsistent leap-year handling.
-
-**Statistical failure** - insufficient paired observations, non-finite moments, or inconsistent merge states.
-
-**Covariance failure** - materially non-PSD correlation/covariance structure.
-
-**Physical failure** - invalid pressure partition, non-finite saturation pressure, or excessive supersaturation.
-
-**Monte Carlo failure** - insufficient valid draws or non-converged higher moments.
-
-**Persistence failure** - checksum mismatch, incompatible checkpoint schema, or incomplete NetCDF output.
-
-A good production log should make the failure class obvious without reading the entire trace.
-
-## 18.20 Scientific interpretation of the four products
-
-### Relative humidity
-
-RH is dimensionless after conversion to percent and describes vapor pressure relative to saturation at temperature. It is intuitive, but because it depends on both $T$ and $T_d$, its distribution is strongly nonlinear.
-
-### Vapor pressure
-
-Vapor pressure is directly related to the actual water-vapor partial pressure and is often useful for thermodynamic diagnostics where relative humidity's temperature dependence is undesirable.
-
-### Mixing ratio
-
-Mixing ratio measures water-vapor mass relative to dry-air mass under the pressure-partitioning formulation used by the project. The nonlinear denominator makes it sensitive to invalid or near-invalid $e/P$ states.
-
-### Specific humidity
-
-Specific humidity is water-vapor mass per total moist-air mass under the adopted formulation. It is bounded and often convenient for transport and moisture-budget applications.
-
-The four products should not be interpreted as interchangeable. They answer different scientific questions and inherit different nonlinearities from the same joint atmospheric state.
-
-## 18.21 Uncertainty taxonomy
-
-Monte Carlo propagation quantifies uncertainty arising from the adopted stochastic representation of the state and its nonlinear transformation. It does **not**, by itself, quantify all scientific uncertainty.
-
-Separate uncertainty families include:
-
-- parameter estimation uncertainty,
-- Gaussian-model structural uncertainty,
-- reanalysis uncertainty,
-- temporal dependence effects,
-- spatial representativeness,
-- calendar-convention sensitivity,
-- thermodynamic formula sensitivity,
-- Monte Carlo sampling error,
-- data-acquisition and preprocessing uncertainty.
-
-The distinction should appear explicitly in publications and reports.
-
-## 18.22 Sensitivity design
-
-A robust sensitivity campaign can vary one scientific decision at a time while preserving a frozen baseline. High-value dimensions include Monte Carlo sample count, PSD repair tolerance, Gaussian versus alternative dependence model, calendar convention, minimum observation threshold, and vapor-pressure formulation.
-
-For each sensitivity axis, record:
-
-```text
-baseline configuration
-alternative configuration
-maximum absolute difference
-median absolute difference
-relative difference where defined
-spatial pattern of change
-scientific conclusion changed? yes/no
-```
-
-The purpose is not to make every choice uncertainty-free. It is to show whether the scientific conclusion is robust to reasonable modeling decisions.
-
-## 18.23 Publication-ready methods statement
-
-A compact methods statement derived from the documented design is:
-
-> Daily ERA5-Land 2-m air temperature, 2-m dew-point temperature, and surface pressure were normalized to a 366-slot climatological calendar in which February 28 and February 29 were pooled. For each climatological day and grid cell, paired-valid observations were summarized in the joint state $(T,T_d,\ln P)$ using numerically stable online and mergeable moment accumulation. The resulting dependence model was propagated through phase-aware saturation vapor-pressure equations using streaming multivariate Monte Carlo, and relative humidity, vapor pressure, mixing ratio, and specific humidity were summarized by mean, sample standard deviation, bias-corrected skewness, and Fisher excess kurtosis. Checkpoints, configuration hashes, source hashes, diagnostics, and NetCDF metadata were retained to support restartability and reproducibility.
-
-This wording should be adapted to the exact executed configuration before publication.
-
-## 18.24 Reviewer checklist
-
-Before accepting a result, a reviewer should ask:
-
-- Is the exact version of `moisture_climatology_v6.py` identified?
-- Is the ERA5-Land retrieval request archived?
-- Are source units and internal units explicit?
-- Is the leap-day convention reported?
-- Is paired-valid screening documented?
-- Is the Gaussian assumption justified or sensitivity-tested?
-- Are covariance repairs quantified?
-- Is Monte Carlo convergence demonstrated for higher moments?
-- Are invalid $e/P$ realizations reported?
-- Are restart and uninterrupted runs compared?
-- Are the final NetCDF files checksummed?
-- Can another researcher reconstruct the environment and configuration?
-
-## 18.25 Maintainer rules
-
-1. Treat `moisture_climatology_v6.py` as scientific source of truth.
-2. Never change a default without recording it in the release notes.
-3. Never change the leap-day convention silently.
-4. Never hide covariance repairs.
-5. Never treat Monte Carlo convergence as proof of total physical uncertainty.
-6. Never commit CDS credentials.
-7. Never report undocumented modules as shipped components.
-8. Regenerate README and PDF when the scientific contract changes.
-9. Run the complete QA gate before tagging a release.
-10. Preserve hashes and provenance with final NetCDF artifacts.
-
-# 19. Extended Configuration Reference
-
-| Parameter | Meaning | Scientific consequence | Operational consequence |
-|---|---|---|---|
-| `PERIOD` | Historical climatology interval | Defines sample population | Controls input volume |
-| `N_SAMPLES` | MC draws per day/cell | Controls propagation sampling error | Main CPU driver |
-| `CELL_CHUNK_SIZE` | Spatial chunk | No direct scientific change | Peak RAM |
-| `SAMPLE_BATCH_SIZE` | MC batch size | No direct scientific change | Peak RAM + vectorization |
-| `MAX_WORKERS` | Process concurrency | No direct scientific change | CPU/RAM/I/O contention |
-| `RANDOM_SEED` | Deterministic random stream | Fixes reproducibility of sampling | Enables exact/near-exact reruns |
-| `MIN_OBS` | Minimum historical paired observations | Controls where a daily/cell model is considered estimable | Missing-data coverage |
-| `PSD_REPAIR_TOL` | Repair threshold | Controls acceptable numerical correction | Failure/rejection frequency |
-| `SCHEMA_VERSION` | Checkpoint/output contract | Defines compatibility | Restart eligibility |
-
-Treat values shown in the current project documentation as defaults. The executed run configuration is authoritative.
-
-# 20. Data Lineage Template
-
-A practical lineage record should contain:
-
-```text
-Dataset name:
-Product/version:
-Source URL or catalogue identifier:
-Variables:
-Years:
-Months:
-Daily statistic:
-Sub-daily frequency:
-UTC/local-day convention:
-Spatial subset:
-Retrieval timestamp:
-Input files:
-Input SHA-256:
-Preprocessing script:
-Preprocessing SHA-256:
-Engine script:
-Engine SHA-256:
-Configuration hash:
-Checkpoint set:
-Final NetCDF SHA-256:
-Validation log:
-Analyst/release identifier:
-```
-
-# 21. Reproducible Experiment Template
-
-```yaml
-experiment:
-  id: HCE-YYYYMMDD-HHMM
-  objective: "daily moisture climatology"
-  period: "1981-2020"
-  dataset: "ERA5-Land"
-  calendar:
-    slots: 366
-    feb28_feb29_pool: true
-    reserved_slot: 59
-  state:
-    variables: [T_C, Td_C, ln_P_hPa]
-  propagation:
-    method: multivariate_normal_streaming_mc
-    samples: 5000
-    seed: 20260821
-  memory:
-    cell_chunk: 1024
-    sample_batch: 256
-    workers: 2
-  outputs:
-    format: NetCDF4
-    diagnostics: true
-  integrity:
-    script_sha256: "..."
-    config_hash: "..."
-```
-
-# 22. Minimal Operational Playbook
+## 24. Operational runbook
 
 ### Before starting
 
-Confirm the input archive is complete, units are correct, date/time conventions are frozen, and enough paired observations exist for the intended climatological period.
+- freeze the code version;
+- freeze configuration;
+- verify input inventories;
+- verify timestamps and units;
+- verify the common grid;
+- confirm the 1980 edge file exists for the first windows;
+- confirm adequate 2021 padding for the final windows.
 
 ### During accumulation
 
-Watch paired-valid counts, annual state sizes, checksum generation, and memory utilization. A successful process that silently drops large portions of the record is not a successful scientific run.
+Monitor:
 
-### During Monte Carlo
+```text
+GLOBAL PROGRESS
+YEAR PROGRESS
+completed units
+remaining units
+rate
+ETA
+RAM / CPU
+checkpoint timestamp
+```
 
-Watch valid sample counts, supersaturation, invalid $e/P$, covariance validity, and convergence indicators. Do not accept a run only because it completed without an exception.
+### After interruption
+
+1. leave the partial checkpoint files intact;
+2. rerun the same code and configuration;
+3. the completion bitmap determines which DOY/chunk units are skipped;
+4. incomplete units are recomputed;
+5. the year is accepted only when all spatial-day units are committed.
 
 ### Before publication
 
-Archive final NetCDF files, diagnostics, configuration, source checksum, input manifest, environment specification, validation summary, and the exact README/PDF corresponding to the release.
-
-# 23. Versioning and Documentation Synchronization
-
-A recommended release unit is:
+Archive:
 
 ```text
-source code
-+ configuration schema
-+ README
-+ scientific PDF
-+ tests
-+ provenance manifest
-+ changelog
-+ output schema
+main NetCDF
+statistics diagnostics
+bivariate parameters
+empirical 2-D PDFs
+selection product
+bivariate dominance PDF/PNGs
+run manifest
+source hash
+input manifest
+validation report
+README
+scientific PDF
 ```
 
-The README is the first-line human interface. The PDF is the long-form scientific reference. Both should describe the same versioned contract. When a formula, variable, default, schema field, or calendar rule changes, both documents should be regenerated in the same release.
+---
 
-# 24. Final Scientific Assessment
+## 25. Configuration reference
 
-The architecture is strong for a reproducible, memory-aware climatological workflow because it separates the empirical state-estimation problem from the nonlinear moisture transformation problem. Online/mergeable statistics, explicit joint dependence, controlled covariance validation, streaming Monte Carlo, and checkpoint-aware persistence make the design scalable and auditable.
+| Parameter | Current value | Role |
+|---|---:|---|
+| `START_YEAR` | 1981 | Target climatology start |
+| `END_YEAR` | 2020 | Target climatology end |
+| `DOY_COUNT` | 366 | Calendar slots |
+| `MAX_WORKERS` | 2 | Process concurrency |
+| `CHUNK_LAT` | 32 | Spatial latitude chunk |
+| `CHUNK_LON` | 64 | Spatial longitude chunk |
+| `PROGRESS_FLUSH_CHUNKS` | 16 | JSON progress flush cadence |
+| `PROGRESS_LOG_EVERY_CHUNKS` | 8 | Progress log cadence |
+| `BIVARIATE_PAIRS` | `(('rh','q'),)` | Primary bivariate pair |
+| `BIVARIATE_NX` | 8 | Empirical x bins |
+| `BIVARIATE_NY` | 8 | Empirical y bins |
+| `BUILD_EMPIRICAL_BIVARIATE` | True | Build empirical 2-D PDF |
+| `WINDOW_HALF_WIDTH_DAYS` | 2 | Centred local fit window |
+| `WINDOW_SIZE_DAYS` | 5 | Window length |
+| `FIT_MIN_OBS` | 30 | Candidate-fit minimum sample |
+| `BIMODAL_N_INIT` | 10 | Two-component EM starts |
+| `BIMODAL_MAX_ITER` | 1000 | EM iteration limit |
+| `BIMODAL_TOL` | `1e-4` | EM convergence tolerance |
+| `BIMODAL_REG_COVAR` | `1e-6` | EM covariance regularisation |
 
-The main scientific caution is not numerical; it is model adequacy. A Gaussian state model can be a useful approximation, but its validity depends on season, terrain, synoptic regime, sample size, and the statistic being reported. Higher moments are especially fragile. The correct interpretation of the system is therefore:
+Treat the executable configuration and run manifest as authoritative for an actual release.
 
-> a transparent stochastic propagation framework whose credibility comes from validation and sensitivity analysis, not from the Gaussian assumption alone.
+---
 
-# Appendix A - Formula Sheet
+## 26. Example commands
 
-| Quantity | Formula |
-|---|---|
-| Celsius temperature | $T_C=T_K-273.15$ |
-| Celsius dew point | $T_{d,C}=T_{d,K}-273.15$ |
-| Pressure hPa | $P_{hPa}=P_{Pa}/100$ |
-| Log pressure | $L=\ln(P_{hPa})$ |
-| Water saturation pressure | $e_{s,w}(T)=6.112\exp(17.67T/(T+243.5))$ |
-| Ice saturation pressure | $e_{s,i}(T)=6.112\exp(22.46T/(T+272.62))$ |
-| Vapor pressure | $e=e_s(T_d)$ |
-| Relative humidity | $RH=100e_s(T_d)/e_s(T)$, bounded for reporting |
-| Mixing ratio | $r=0.622e/(P-e)$ |
-| Specific humidity | $q=r/(1+r)$ |
-| Sample variance | $s^2=M_2/(n-1)$ |
-| MC standard error scaling | $SE\propto N^{-1/2}$ |
+### Run the main climatology
 
-# Appendix B - NetCDF Naming Contract
+```bash
+python moisture_climatology_v7_5.py
+```
 
-The documented principal naming families are:
+### Generate the bivariate dominance report
+
+```bash
+python bivariate_dominance_report.py \
+  moisture_bivariate_model_selection_1981_2020_v7_5.nc \
+  --output-pdf bivariate_distribution_dominance_report.pdf \
+  --output-dir bivariate_dominance_figures
+```
+
+### Inspect a station/grid-cell window
+
+The fitting layer is designed to expose a target date, coordinate/cell, and variable through the centred 5-day extraction utilities. For large-scale station workflows, wrap those functions in a station-ID table rather than reading the entire regional grid repeatedly.
+
+### Reset generated artifacts
+
+```bash
+python moisture_climatology_reset.py --dry-run
+```
+
+Use a non-interactive deletion only after reviewing the dry-run output.
+
+---
+
+## 27. Scientific interpretation
+
+The four primary moisture fields are not interchangeable.
+
+### RH
+
+Intuitive, but strongly nonlinear because both temperature and dew point enter the ratio.
+
+### Vapor pressure
+
+Closer to actual water-vapor partial pressure and less directly temperature-normalised than RH.
+
+### Mixing ratio
+
+Sensitive to the `P - e` denominator and therefore to physically invalid or near-invalid states.
+
+### Specific humidity
+
+Bounded and useful for many transport and budget applications.
+
+The bivariate products answer a different question:
+
+> **How are two moisture variables jointly distributed at a given climatological day and location?**
+
+The purpose of keeping an empirical surface alongside parametric models is to distinguish:
 
 ```text
-mean_rh
-std_rh
-skew_rh
-kurt_rh
-mean_vapor_pressure
-std_vapor_pressure
-skew_vapor_pressure
-kurt_vapor_pressure
-mean_mixing_ratio
-std_mixing_ratio
-skew_mixing_ratio
-kurt_mixing_ratio
-mean_specific_humidity
-std_specific_humidity
-skew_specific_humidity
-kurt_specific_humidity
+data-driven evidence
 ```
 
-Diagnostics:
+from:
 
 ```text
-supersaturation_fraction
-invalid_e_over_p_fraction
-invalid_covariance_fraction
-min_eigenvalue
-valid_sample_count
-corr_T_Td
-corr_T_logP
-corr_Td_logP
-valid_observation_count
+parametric approximation
 ```
 
-Coordinates/metadata:
+That distinction should remain explicit in every publication and downstream analysis.
+
+---
+
+## 28. Release checklist
+
+Before tagging a production release:
+
+### Data
+
+- [ ] All target months are present.
+- [ ] Edge padding for 1981 is present.
+- [ ] 2021 padding is sufficient for the 2020 endpoint.
+- [ ] `valid_time`/`time` coordinates are valid and monotonic.
+- [ ] T2m, D2m and SP grids agree.
+- [ ] Units are verified.
+
+### Scientific core
+
+- [ ] Calendar tests pass.
+- [ ] Physical reference tests pass.
+- [ ] Online moments match offline references.
+- [ ] Merge equivalence passes.
+- [ ] Empirical 2-D PDF normalisation passes.
+- [ ] Bimodal synthetic recovery passes.
+- [ ] Skew-Normal candidate fit passes.
+- [ ] Pearson III candidate fit passes.
+- [ ] Beta endpoint handling passes.
+- [ ] Copula estimator passes synthetic dependence checks.
+
+### Operations
+
+- [ ] Checkpoint/restart test passes.
+- [ ] Completion bitmap is monotonic.
+- [ ] Progress percentage is correct.
+- [ ] Remaining-unit count is correct.
+- [ ] ETA does not crash the run when rate is unavailable.
+- [ ] RAM/CPU logging is non-fatal.
+
+### Outputs
+
+- [ ] Main NetCDF dimensions are correct.
+- [ ] Diagnostic NetCDF dimensions are correct.
+- [ ] Bivariate output is internally consistent.
+- [ ] `_FillValue` metadata is correct.
+- [ ] Units and long names are present.
+- [ ] Run manifest is complete.
+- [ ] SHA-256 hashes are archived.
+
+### Documentation
+
+- [ ] README matches the executable code.
+- [ ] Scientific PDF matches the README.
+- [ ] v6 historical status is preserved.
+- [ ] v6 limitations are explicitly documented.
+- [ ] Bivariate dominance report documentation is included.
+- [ ] No future/unimplemented capability is presented as shipped production behavior.
+
+---
+
+# Appendix A — Formula sheet
+
+```text
+T_C   = T_K - 273.15
+Td_C  = Td_K - 273.15
+P_hPa = P_Pa / 100
+```
+
+```text
+es_water(T) = 6.112 * exp(17.67*T / (T + 243.5))
+```
+
+```text
+es_ice(T) = 6.112 * exp(22.46*T / (T + 272.62))
+```
+
+```text
+e  = es(Td)
+RH = 100 * e / es(T)
+r  = 0.622 * e / (P - e)
+q  = r / (1 + r)
+```
+
+```text
+sample variance = M2 / (n - 1)
+```
+
+```text
+AIC  = 2k - 2 logL
+BIC  = k log(n) - 2 logL
+AICc = AIC + 2k(k+1)/(n-k-1)
+```
+
+Bimodal Normal:
+
+```text
+f(x) = w1*N(x | mu1, sigma1)
+     + (1-w1)*N(x | mu2, sigma2)
+```
+
+with stored parameters:
+
+```text
+w1, mu1, sigma1, mu2, sigma2
+```
+
+---
+
+# Appendix B — Output schema
+
+### Main climatology
 
 ```text
 doy
@@ -1605,39 +1533,170 @@ latitude
 longitude
 month
 day
-reserved_day
+
+n_obs
+mean_rh
+std_rh
+skew_rh
+kurt_rh
+
+mean_e
+std_e
+skew_e
+kurt_e
+
+mean_r
+std_r
+skew_r
+kurt_r
+
+mean_q
+std_q
+skew_q
+kurt_q
 ```
 
-# Appendix C - Quality Gate Checklist
+### Diagnostics
 
-- [ ] Source checksum recorded.
-- [ ] Input manifest recorded.
-- [ ] Configuration hash recorded.
-- [ ] Calendar tests pass.
-- [ ] Paired-valid logic tested.
-- [ ] Online versus batch statistics agree.
-- [ ] Covariance symmetry validated.
-- [ ] Eigenvalue diagnostics reviewed.
-- [ ] Physics ground-truth tests pass.
-- [ ] MC convergence reviewed.
-- [ ] Higher-moment stability reviewed.
-- [ ] Restart equivalence checked.
-- [ ] NetCDF metadata audited.
-- [ ] SHA-256 of final outputs recorded.
-- [ ] README and PDF version synchronized.
+```text
+n_obs
+supersaturation_fraction
+invalid_e_over_p_fraction
+```
 
-# Appendix D - README/PDF Synchronization Rule
+### Bivariate reference parameters
 
-The README and PDF in a release should always carry the same:
+For each configured pair:
 
-- software version,
-- schema version,
-- climatology period,
-- calendar convention,
-- default Monte Carlo settings,
-- physical formula set,
-- output naming contract,
-- limitations statement,
-- and provenance expectations.
+```text
+pair_<x>__<y>_mean_x
+pair_<x>__<y>_mean_y
+pair_<x>__<y>_Cxy
+```
 
-When one changes, rebuild both.
+plus the derived correlation fields in the final bivariate product where applicable.
+
+### Empirical 2-D PDF
+
+```text
+x_edges
+ y_edges
+counts / density
+valid_pair_count
+DOY
+latitude
+longitude
+```
+
+The exact variable names in the final file are governed by the executable schema and should be checked from the generated NetCDF rather than inferred from this document.
+
+---
+
+# Appendix C — Failure classes
+
+A production log should make the failure class identifiable.
+
+### Input / provenance failure
+
+Examples:
+
+```text
+missing month
+inconsistent coordinate
+unit mismatch
+unexpected time coordinate
+checksum mismatch
+```
+
+### Calendar failure
+
+Examples:
+
+```text
+wrong leap-year mapping
+reserved slot populated incorrectly
+post-February shift
+```
+
+### Statistical failure
+
+Examples:
+
+```text
+insufficient paired observations
+non-finite moments
+merge inconsistency
+```
+
+### Physical failure
+
+Examples:
+
+```text
+e <= 0
+P <= 0
+e >= P
+non-finite saturation pressure
+```
+
+### Checkpoint failure
+
+Examples:
+
+```text
+schema mismatch
+configuration hash mismatch
+incomplete spatial-day bitmap
+corrupt JSON progress record
+```
+
+### Model-fitting failure
+
+Examples:
+
+```text
+insufficient sample
+non-positive scale
+failed likelihood evaluation
+invalid Beta support
+EM non-convergence
+```
+
+### Reporting failure
+
+Examples:
+
+```text
+missing best_model_code
+unknown model code
+missing latitude/longitude
+invalid model_names mapping
+```
+
+---
+
+## Final scientific position
+
+HumidClimatologyEngine deliberately maintains two methodological generations:
+
+```text
+v6
+Historical / educational
+Daily statistics -> Joint Gaussian -> Monte Carlo
+
+v7
+Production direction
+Hourly data -> Direct thermodynamic transformation -> Empirical climatology
+                                      |
+                                      +--> empirical 2-D probability
+                                      |
+                                      +--> 5-day local distribution fitting
+                                      |
+                                      +--> candidate marginals + copula dependence
+                                      |
+                                      +--> Bimodal / skewed / bounded alternatives
+```
+
+The project should prefer **evidence over a fixed distributional assumption**. The empirical 2-D product is the non-parametric reference; Normal, Skew-Normal, Pearson III, Beta, Bimodal Normal, and copula families are modelling candidates whose adequacy must be demonstrated for the relevant day, location, and scientific question.
+
+The README is intentionally explicit about what is implemented, what is a reference candidate, and what remains a second-pass orchestration task. That distinction is part of the scientific reproducibility contract.
