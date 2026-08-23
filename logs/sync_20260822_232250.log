@@ -1,0 +1,17 @@
+2026-08-22 23:22:50,872 - INFO - ✅ Found gh at: C:\C\gh.exe
+2026-08-22 23:22:51,646 - INFO - ✅ Already logged in.
+2026-08-22 23:22:52,887 - INFO - ℹ️  Repository already exists on GitHub.
+2026-08-22 23:22:52,919 - INFO - 🌐 Remote already set: https://github.com/AminFazlKazemi/HumidClimatologyEngine.git
+2026-08-22 23:22:52,949 - INFO - 🔄 Fetching remote state to create a backup...
+2026-08-22 23:22:54,190 - INFO - 📦 Archiving current remote state to branch: backup/main_20260822_232254
+2026-08-22 23:42:57,975 - INFO - ✅ Found gh at: C:\C\gh.exe
+2026-08-22 23:42:58,656 - INFO - ✅ Already logged in.
+2026-08-22 23:42:59,883 - INFO - ℹ️  Repository already exists on GitHub.
+2026-08-22 23:42:59,926 - INFO - 🌐 Remote already set: https://github.com/AminFazlKazemi/HumidClimatologyEngine.git
+2026-08-22 23:42:59,957 - INFO - 📝 Updating .gitignore to exclude data/ and .nc files...
+2026-08-22 23:42:59,960 - INFO - ✅ .gitignore updated.
+2026-08-22 23:43:00,026 - INFO - 🔄 Fetching remote state to create a backup...
+2026-08-22 23:43:01,185 - INFO - 📦 Archiving current remote state to branch: backup/main_20260822_234301
+2026-08-22 23:43:07,470 - INFO - ✅ Backup successfully archived.
+2026-08-22 23:43:07,471 - INFO - 📦 Staging all files...
+2026-08-22 23:43:07,855 - INFO - 📝 Committing: Complete reset - 2026-08-22 23:43
