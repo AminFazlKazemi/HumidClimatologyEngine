@@ -818,7 +818,8 @@ def process_year_empirical(year: int) -> tuple[int, Optional[Path]]:
                         j1 = min(j0 + CHUNK_LAT, ny)
                         for xci, i0 in enumerate(range(0, nx, CHUNK_LON)):
                             i1 = min(i0 + CHUNK_LON, nx)
-                            if int(ds_ckpt.variables["completed_chunk"][cdoy - 1, yci, xci]) == 1:
+                            flag = np.ma.filled(ds_ckpt.variables["completed_chunk"][cdoy - 1, yci, xci], 0)
+                            if int(flag) == 1:
                                 slot_completed += 1
                                 continue
 
@@ -1350,6 +1351,8 @@ def run_tests() -> None:
 def _global_progress(years: list[int]) -> tuple[int, int, float, int]:
     done_units = 0
     total_units = 0
+    # Always include the full work plan, even before any progress JSON exists.
+    # This prevents an initial misleading 0/0 global progress report.
     for year in years:
         final_path, json_path, part_path = year_paths(year)
         meta = _read_progress(json_path)
@@ -1392,6 +1395,9 @@ def main() -> None:
     logger.info("GLOBAL WORK PLAN | %d years | %d units/year | %d total units", len(years), per_year_units, grand_total)
 
     remaining_years = [y for y in years if not is_year_complete(y)]
+    initial_done = grand_total - len(remaining_years) * per_year_units
+    initial_remaining = grand_total - initial_done
+    logger.info("GLOBAL PROGRESS | %.2f%% | %d/%d units | remaining %d | active years %d", 100.0 * initial_done / max(grand_total, 1), initial_done, grand_total, initial_remaining, len(remaining_years))
     if remaining_years:
         logger.info("Annual checkpoints to process: %d/%d", len(remaining_years), len(years))
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:

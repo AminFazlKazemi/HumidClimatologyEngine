@@ -31,3 +31,9 @@ checkpoints_*/
 *.part
 .DS_Store
 Thumbs.db
+
+# Added by Smart Sync Tool
+*.pkl
+*.h5
+*.parquet
+*.pyc

@@ -7,3 +7,18 @@
 2026-08-22 23:09:48,687 - INFO - ✅ Backup successfully archived at: https://github.com/AminFazlKazemi/HumidClimatologyEngine/tree/backup/main_20260822_230935
 2026-08-22 23:09:48,688 - INFO - 📦 Staging all files...
 2026-08-22 23:09:49,852 - INFO - 📝 Committing: Complete reset - 2026-08-22 23:09
+2026-08-22 23:09:51,473 - INFO - 💥 Force-pushing (with lease) to https://github.com/AminFazlKazemi/HumidClimatologyEngine.git ...
+2026-08-22 23:09:59,507 - INFO - 🚀 Force push successful. Previous version is archived in backup branch.
+2026-08-22 23:09:59,513 - INFO - 📊 Report: K:\kazemi\papers\temperature_interpolation\HumidClimatologyEngine\logs\report_20260822_230959.json
+2026-08-22 23:14:18,572 - INFO - ✅ Found gh at: C:\C\gh.exe
+2026-08-22 23:14:19,138 - INFO - ✅ Already logged in.
+2026-08-22 23:14:20,438 - INFO - ℹ️  Repository already exists on GitHub.
+2026-08-22 23:14:20,468 - INFO - 🌐 Remote already set: https://github.com/AminFazlKazemi/HumidClimatologyEngine.git
+2026-08-22 23:14:20,498 - INFO - 🔄 Fetching remote state to create a backup...
+2026-08-22 23:14:21,510 - INFO - 📦 Archiving current remote state to branch: backup/main_20260822_231421
+2026-08-22 23:14:27,509 - INFO - ✅ Backup successfully archived at: https://github.com/AminFazlKazemi/HumidClimatologyEngine/tree/backup/main_20260822_231421
+2026-08-22 23:14:27,510 - INFO - 📦 Staging all files...
+2026-08-22 23:14:27,613 - INFO - 📝 Committing: Complete reset - 2026-08-22 23:14
+2026-08-22 23:14:27,867 - INFO - 💥 Force-pushing (with lease) to https://github.com/AminFazlKazemi/HumidClimatologyEngine.git ...
+2026-08-22 23:14:34,875 - INFO - 🚀 Force push successful. Previous version is archived in backup branch.
+2026-08-22 23:14:34,878 - INFO - 📊 Report: K:\kazemi\papers\temperature_interpolation\HumidClimatologyEngine\logs\report_20260822_231434.json
