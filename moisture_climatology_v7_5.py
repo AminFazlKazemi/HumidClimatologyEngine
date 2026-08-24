@@ -1179,12 +1179,9 @@ def _bivariate_progress_read(path: Path) -> dict:
     except Exception: return {}
 
 def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat: np.ndarray, lon: np.ndarray) -> Path:
-    """Build a restartable empirical 2-D PDF with a single-file transaction state.
+    """ساخت یا ادامه‌ی ساخت PDF دوبعدی تجربی برای یک جفت متغیر.
 
-    For each DOY x spatial chunk, ``next_year`` records the first year index that
-    still needs to be accumulated. The histogram counts and ``next_year`` are
-    written to the same NetCDF and synchronized together, so a power failure
-    cannot create a durable count update without its corresponding progress state.
+    از چک‌پوینت داخلی (next_year) برای ادامه از نقطه‌ی قطع استفاده می‌کند.
     """
     require_netcdf4()
     xname, yname = pair
@@ -1196,58 +1193,198 @@ def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat:
     n_y_chunks, n_x_chunks = len(y_ranges), len(x_ranges)
     total_units = DOY_COUNT * n_y_chunks * n_x_chunks
 
+    # باز کردن یا ایجاد فایل خروجی
     if out_path.exists():
         ds = Dataset(out_path, "r+")
     else:
         ds = Dataset(out_path, "w", format="NETCDF4")
-        # ... (ایجاد متغیرها مانند قبل) ...
+        ds.createDimension("doy", DOY_COUNT)
+        ds.createDimension("latitude", ny)
+        ds.createDimension("longitude", nx)
+        ds.createDimension("y_chunk", n_y_chunks)
+        ds.createDimension("x_chunk", n_x_chunks)
+        ds.createDimension("x_bin", BIVARIATE_NX)
+        ds.createDimension("y_bin", BIVARIATE_NY)
+
+        ds.createVariable("doy", "i2", ("doy",))[:] = np.arange(1, DOY_COUNT + 1, dtype=np.int16)
+        ds.createVariable("latitude", "f4", ("latitude",))[:] = lat.astype(np.float32)
+        ds.createVariable("longitude", "f4", ("longitude",))[:] = lon.astype(np.float32)
+        ds.createVariable("x_bin_left", "f8", ("x_bin",))[:] = x_edges[:-1]
+        ds.createVariable("x_bin_right", "f8", ("x_bin",))[:] = x_edges[1:]
+        ds.createVariable("y_bin_left", "f8", ("y_bin",))[:] = y_edges[:-1]
+        ds.createVariable("y_bin_right", "f8", ("y_bin",))[:] = y_edges[1:]
+
+        chunks = (1, min(CHUNK_LAT, ny), min(CHUNK_LON, nx), BIVARIATE_NX, BIVARIATE_NY)
+        ds.createVariable("count", "u2", ("doy", "latitude", "longitude", "x_bin", "y_bin"),
+                          zlib=True, complevel=4, shuffle=True, chunksizes=chunks, fill_value=0)
+        ds.createVariable("n_valid", "u2", ("doy", "latitude", "longitude"),
+                          zlib=True, complevel=4, shuffle=True,
+                          chunksizes=(1, min(CHUNK_LAT, ny), min(CHUNK_LON, nx)), fill_value=0)
+        ds.createVariable("next_year", "i2", ("doy", "y_chunk", "x_chunk"),
+                          zlib=True, complevel=4, fill_value=0)
+
+        # متادیتا
+        ds.purpose = "Empirical 2-D piecewise-constant PDF from hourly observations; no Gaussian assumption"
+        ds.pair = f"{xname}__{yname}"
+        ds.schema_version = SCHEMA_VERSION
+        ds.config_hash = CONFIG_HASH
+        ds.x_range = x_edges[[0, -1]].tolist()
+        ds.y_range = y_edges[[0, -1]].tolist()
+        ds.x_bin_count = BIVARIATE_NX
+        ds.y_bin_count = BIVARIATE_NY
+        ds.pdf_definition = "f(x,y)=count(xbin,ybin)/(N_valid * bin_area) within each bin"
+        ds.restart_definition = "next_year[yday,y_chunk,x_chunk] is committed transactionally with count/n_valid"
         ds.sync()
 
-    indices = {year: (build_file_index(year, T2M_DIR), build_file_index(year, D2M_DIR), build_file_index(year, SP_DIR))
+    # ایندکس‌های سال‌ها
+    indices = {year: (build_file_index(year, T2M_DIR),
+                      build_file_index(year, D2M_DIR),
+                      build_file_index(year, SP_DIR))
                for year in years}
     year_pos = {year: pos for pos, year in enumerate(years)}
 
     try:
-        next_year = np.asarray(ds.variables["next_year"][:], dtype=np.int16)
-        done_units = int(np.count_nonzero(next_year >= len(years)) if DOY_COUNT else 0)
-        logger.info("BIVARIATE START | %s | empirical 2-D PDF | committed units %d/%d", pair, done_units, total_units)
+        # خواندن وضعیت پیشرفت – با دقت نسبت به ماسک
+        next_year_data = ds.variables["next_year"][:]
+        # تبدیل آرایه ماسک‌دار به آرایه معمولی با پر کردن ۰ به جای ماسک
+        next_year_filled = np.ma.filled(next_year_data, 0).astype(np.int16)
+        done_units = int(np.count_nonzero(next_year_filled >= len(years)) if DOY_COUNT else 0)
+        logger.info("BIVARIATE START | %s | empirical 2-D PDF | committed units %d/%d",
+                    pair, done_units, total_units)
 
+        # حلقه بر روی سال‌ها
         for year in years:
             yi = year_pos[year]
             t_idx, d_idx, p_idx = indices[year]
+
             for month in range(1, 13):
                 with open_dataset(t_idx[month]) as dt, open_dataset(d_idx[month]) as dd, open_dataset(p_idx[month]) as dp:
-                    dt = sort_dataset(dt); dd = sort_dataset(dd); dp = sort_dataset(dp)
+                    dt = sort_dataset(dt)
+                    dd = sort_dataset(dd)
+                    dp = sort_dataset(dp)
                     validate_grids_and_axes(dt, dd, dp, year, month)
-                    tu = dt["t2m"].attrs.get("units"); du = dd["d2m"].attrs.get("units"); pu = dp["sp"].attrs.get("units")
-                    native = dt.time.dt.dayofyear.values.astype(np.int16)
-                    cdoys = sorted(set(get_clim_doy(int(d), year) for d in native if get_clim_doy(int(d), year) not in (-1, 59)))
+
+                    tu = dt["t2m"].attrs.get("units")
+                    du = dd["d2m"].attrs.get("units")
+                    pu = dp["sp"].attrs.get("units")
+
+                    native_doys = dt.time.dt.dayofyear.values.astype(np.int16)
+                    # لیست روزهای اقلیمی معتبر (به جز روز ۵۹)
+                    cdoys = sorted({
+                        get_clim_doy(int(d), year)
+                        for d in native_doys
+                        if get_clim_doy(int(d), year) not in (-1, 59)
+                    })
 
                     for cdoy in cdoys:
-                        time_idx = np.flatnonzero(np.array([get_clim_doy(int(d), year) == cdoy for d in native], dtype=bool))
-                        if not time_idx.size:
+                        time_idx = np.flatnonzero([
+                            get_clim_doy(int(d), year) == cdoy
+                            for d in native_doys
+                        ])
+                        if time_idx.size == 0:
                             continue
+
                         for yci, j0 in enumerate(y_ranges):
                             j1 = min(j0 + CHUNK_LAT, ny)
                             for xci, i0 in enumerate(x_ranges):
                                 i1 = min(i0 + CHUNK_LON, nx)
-                                # =============== خط اصلاح‌شده ===============
-                                val = ds.variables["next_year"][cdoy-1, yci, xci]
-                                if not np.ma.is_masked(val) and int(val) >= yi + 1:
+
+                                # ====== اصلاح اصلی: خواندن امن next_year ======
+                                raw_val = ds.variables["next_year"][cdoy - 1, yci, xci]
+                                # اگر ماسک شده باشد یعنی هنوز پردازش نشده → مقدار ۰ در نظر گرفته می‌شود
+                                current_progress = int(np.ma.filled(raw_val, 0))
+                                if current_progress >= yi + 1:
                                     continue
                                 # ==============================================
 
                                 cells = (j1 - j0) * (i1 - i0)
                                 counts = np.zeros((cells, BIVARIATE_NX, BIVARIATE_NY), dtype=np.uint32)
                                 nvalid = np.zeros(cells, dtype=np.uint32)
-                                for ti in time_idx:
-                                    # ... (بقیه‌ی کد مانند قبل) ...
-                                    pass  # (کد اصلی را اینجا قرار دهید)
 
-                                # ... (ادامه‌ی کد) ...
-        # ... (بخش نهایی) ...
+                                for ti in time_idx:
+                                    T = convert_temperature(
+                                        dt["t2m"].isel(time=int(ti), latitude=slice(j0, j1), longitude=slice(i0, i1)).values,
+                                        tu, "t2m"
+                                    ).reshape(-1)
+                                    Td = convert_temperature(
+                                        dd["d2m"].isel(time=int(ti), latitude=slice(j0, j1), longitude=slice(i0, i1)).values,
+                                        du, "d2m"
+                                    ).reshape(-1)
+                                    P = convert_pressure(
+                                        dp["sp"].isel(time=int(ti), latitude=slice(j0, j1), longitude=slice(i0, i1)).values,
+                                        pu, "sp"
+                                    ).reshape(-1)
+
+                                    ph = derive_moisture(T, Td, P)
+                                    xv = np.asarray(ph[xname], dtype=np.float64).reshape(-1)
+                                    yv = np.asarray(ph[yname], dtype=np.float64).reshape(-1)
+
+                                    valid = np.isfinite(xv) & np.isfinite(yv)
+                                    valid &= (xv >= x_edges[0]) & (xv <= x_edges[-1])
+                                    valid &= (yv >= y_edges[0]) & (yv <= y_edges[-1])
+
+                                    idx_valid = np.flatnonzero(valid)
+                                    if idx_valid.size == 0:
+                                        continue
+
+                                    xx = xv[idx_valid]
+                                    yy = yv[idx_valid]
+                                    ix = np.searchsorted(x_edges, xx, side="right") - 1
+                                    iy = np.searchsorted(y_edges, yy, side="right") - 1
+                                    ix = np.minimum(ix, BIVARIATE_NX - 1)
+                                    iy = np.minimum(iy, BIVARIATE_NY - 1)
+
+                                    np.add.at(nvalid, idx_valid, 1)
+                                    np.add.at(counts, (idx_valid, ix, iy), 1)
+
+                                # خواندن مقادیر قدیمی با دقت نسبت به ماسک
+                                old_counts = np.asarray(
+                                    ds.variables["count"][cdoy - 1, j0:j1, i0:i1, :, :],
+                                    dtype=np.uint32
+                                ).reshape(cells, BIVARIATE_NX, BIVARIATE_NY)
+                                old_n = np.asarray(
+                                    ds.variables["n_valid"][cdoy - 1, j0:j1, i0:i1],
+                                    dtype=np.uint32
+                                ).reshape(-1)
+
+                                merged_counts = old_counts + counts
+                                merged_n = old_n + nvalid
+
+                                if merged_counts.max(initial=0) > np.iinfo(np.uint16).max or \
+                                   merged_n.max(initial=0) > np.iinfo(np.uint16).max:
+                                    raise OverflowError("Empirical bivariate histogram exceeds uint16 capacity.")
+
+                                # ذخیره‌سازی تراکنشی (داده + وضعیت)
+                                ds.variables["count"][cdoy - 1, j0:j1, i0:i1, :, :] = \
+                                    merged_counts.astype(np.uint16).reshape(j1 - j0, i1 - i0, BIVARIATE_NX, BIVARIATE_NY)
+                                ds.variables["n_valid"][cdoy - 1, j0:j1, i0:i1] = \
+                                    merged_n.astype(np.uint16).reshape(j1 - j0, i1 - i0)
+                                ds.variables["next_year"][cdoy - 1, yci, xci] = yi + 1
+                                ds.sync()
+
+                                # گزارش پیشرفت هر از گاهی
+                                if (yi == len(years) - 1) and \
+                                   ((cdoy % 10 == 0) or
+                                    (cdoy == DOY_COUNT - 1 and xci == len(x_ranges) - 1 and yci == len(y_ranges) - 1)):
+                                    # خواندن دوباره next_year با پر کردن ماسک
+                                    next_year_filled = np.ma.filled(ds.variables["next_year"][:], 0).astype(np.int16)
+                                    committed = int(np.count_nonzero(next_year_filled >= len(years)))
+                                    pct = 100.0 * committed / max(total_units, 1)
+                                    logger.info("BIVARIATE PROGRESS | %s | %.2f%% | %d/%d spatial-day units | remaining %d | through year %d",
+                                                pair, pct, committed, total_units, total_units - committed, year)
+
+        # بررسی تکمیل نهایی
+        next_year_filled = np.ma.filled(ds.variables["next_year"][:], 0).astype(np.int16)
+        committed = int(np.count_nonzero(next_year_filled >= len(years)))
+        if committed != total_units:
+            raise RuntimeError(f"Empirical bivariate checkpoint incomplete: {committed}/{total_units} units committed")
+        logger.info("BIVARIATE COMPLETE | %s | 100.00%% | %d/%d units", pair, committed, total_units)
+
+        return out_path
+
     finally:
         ds.close()
+
 # =============================================================================
 # 12. TESTS
 # =============================================================================
