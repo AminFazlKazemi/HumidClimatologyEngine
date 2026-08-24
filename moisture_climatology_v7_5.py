@@ -1200,38 +1200,7 @@ def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat:
         ds = Dataset(out_path, "r+")
     else:
         ds = Dataset(out_path, "w", format="NETCDF4")
-        ds.createDimension("doy", DOY_COUNT)
-        ds.createDimension("latitude", ny)
-        ds.createDimension("longitude", nx)
-        ds.createDimension("y_chunk", n_y_chunks)
-        ds.createDimension("x_chunk", n_x_chunks)
-        ds.createDimension("x_bin", BIVARIATE_NX)
-        ds.createDimension("y_bin", BIVARIATE_NY)
-        ds.createVariable("doy", "i2", ("doy",))[:] = np.arange(1, DOY_COUNT + 1, dtype=np.int16)
-        ds.createVariable("latitude", "f4", ("latitude",))[:] = lat.astype(np.float32)
-        ds.createVariable("longitude", "f4", ("longitude",))[:] = lon.astype(np.float32)
-        ds.createVariable("x_bin_left", "f8", ("x_bin",))[:] = x_edges[:-1]
-        ds.createVariable("x_bin_right", "f8", ("x_bin",))[:] = x_edges[1:]
-        ds.createVariable("y_bin_left", "f8", ("y_bin",))[:] = y_edges[:-1]
-        ds.createVariable("y_bin_right", "f8", ("y_bin",))[:] = y_edges[1:]
-        chunks = (1, min(CHUNK_LAT, ny), min(CHUNK_LON, nx), BIVARIATE_NX, BIVARIATE_NY)
-        ds.createVariable("count", "u2", ("doy", "latitude", "longitude", "x_bin", "y_bin"),
-                          zlib=True, complevel=4, shuffle=True, chunksizes=chunks, fill_value=0)
-        ds.createVariable("n_valid", "u2", ("doy", "latitude", "longitude"),
-                          zlib=True, complevel=4, shuffle=True,
-                          chunksizes=(1, min(CHUNK_LAT, ny), min(CHUNK_LON, nx)), fill_value=0)
-        ds.createVariable("next_year", "i2", ("doy", "y_chunk", "x_chunk"),
-                          zlib=True, complevel=4, fill_value=0)
-        ds.purpose = "Empirical 2-D piecewise-constant PDF from hourly observations; no Gaussian assumption"
-        ds.pair = f"{xname}__{yname}"
-        ds.schema_version = SCHEMA_VERSION
-        ds.config_hash = CONFIG_HASH
-        ds.x_range = x_edges[[0, -1]].tolist()
-        ds.y_range = y_edges[[0, -1]].tolist()
-        ds.x_bin_count = BIVARIATE_NX
-        ds.y_bin_count = BIVARIATE_NY
-        ds.pdf_definition = "f(x,y)=count(xbin,ybin)/(N_valid * bin_area) within each bin"
-        ds.restart_definition = "next_year[yday,y_chunk,x_chunk] is committed transactionally with count/n_valid"
+        # ... (ایجاد متغیرها مانند قبل) ...
         ds.sync()
 
     indices = {year: (build_file_index(year, T2M_DIR), build_file_index(year, D2M_DIR), build_file_index(year, SP_DIR))
@@ -1262,59 +1231,23 @@ def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat:
                             j1 = min(j0 + CHUNK_LAT, ny)
                             for xci, i0 in enumerate(x_ranges):
                                 i1 = min(i0 + CHUNK_LON, nx)
-                                if int(ds.variables["next_year"][cdoy-1, yci, xci]) >= yi + 1:
+                                # =============== خط اصلاح‌شده ===============
+                                val = ds.variables["next_year"][cdoy-1, yci, xci]
+                                if not np.ma.is_masked(val) and int(val) >= yi + 1:
                                     continue
+                                # ==============================================
 
                                 cells = (j1 - j0) * (i1 - i0)
                                 counts = np.zeros((cells, BIVARIATE_NX, BIVARIATE_NY), dtype=np.uint32)
                                 nvalid = np.zeros(cells, dtype=np.uint32)
                                 for ti in time_idx:
-                                    T = convert_temperature(dt["t2m"].isel(time=int(ti), latitude=slice(j0,j1), longitude=slice(i0,i1)).values, tu, "t2m")
-                                    Td = convert_temperature(dd["d2m"].isel(time=int(ti), latitude=slice(j0,j1), longitude=slice(i0,i1)).values, du, "d2m")
-                                    P = convert_pressure(dp["sp"].isel(time=int(ti), latitude=slice(j0,j1), longitude=slice(i0,i1)).values, pu, "sp")
-                                    ph = derive_moisture(T.reshape(-1), Td.reshape(-1), P.reshape(-1))
-                                    xv = np.asarray(ph[xname], dtype=np.float64).reshape(-1)
-                                    yv = np.asarray(ph[yname], dtype=np.float64).reshape(-1)
-                                    valid = np.isfinite(xv) & np.isfinite(yv)
-                                    valid &= (xv >= x_edges[0]) & (xv <= x_edges[-1]) & (yv >= y_edges[0]) & (yv <= y_edges[-1])
-                                    idx = np.flatnonzero(valid)
-                                    if idx.size == 0:
-                                        continue
-                                    xx = xv[idx]; yy = yv[idx]
-                                    ix = np.searchsorted(x_edges, xx, side="right") - 1
-                                    iy = np.searchsorted(y_edges, yy, side="right") - 1
-                                    ix = np.minimum(ix, BIVARIATE_NX - 1); iy = np.minimum(iy, BIVARIATE_NY - 1)
-                                    np.add.at(nvalid, idx, 1)
-                                    np.add.at(counts, (idx, ix, iy), 1)
+                                    # ... (بقیه‌ی کد مانند قبل) ...
+                                    pass  # (کد اصلی را اینجا قرار دهید)
 
-                                old_counts = np.asarray(ds.variables["count"][cdoy-1,j0:j1,i0:i1,:,:], dtype=np.uint32).reshape(cells,BIVARIATE_NX,BIVARIATE_NY)
-                                old_n = np.asarray(ds.variables["n_valid"][cdoy-1,j0:j1,i0:i1], dtype=np.uint32).reshape(-1)
-                                merged_counts = old_counts + counts
-                                merged_n = old_n + nvalid
-                                if merged_counts.max(initial=0) > np.iinfo(np.uint16).max or merged_n.max(initial=0) > np.iinfo(np.uint16).max:
-                                    raise OverflowError("Empirical bivariate histogram exceeds uint16 capacity.")
-
-                                # Transaction: data + progress state are synchronized together.
-                                ds.variables["count"][cdoy-1,j0:j1,i0:i1,:,:] = merged_counts.astype(np.uint16).reshape(j1-j0,i1-i0,BIVARIATE_NX,BIVARIATE_NY)
-                                ds.variables["n_valid"][cdoy-1,j0:j1,i0:i1] = merged_n.astype(np.uint16).reshape(j1-j0,i1-i0)
-                                ds.variables["next_year"][cdoy-1,yci,xci] = yi + 1
-                                ds.sync()
-
-                                # Recompute compact progress count periodically; no separate progress truth exists.
-                                if (yi == len(years)-1) and ((cdoy % 10 == 0) or (cdoy == DOY_COUNT-1 and xci == len(x_ranges)-1 and yci == len(y_ranges)-1)):
-                                    committed = int(np.count_nonzero(np.asarray(ds.variables["next_year"][:]) >= len(years)))
-                                    pct = 100.0 * committed / max(total_units, 1)
-                                    logger.info("BIVARIATE PROGRESS | %s | %.2f%% | %d/%d spatial-day units | remaining %d | through year %d",
-                                                pair, pct, committed, total_units, total_units-committed, year)
-
-        committed = int(np.count_nonzero(np.asarray(ds.variables["next_year"][:]) >= len(years)))
-        if committed != total_units:
-            raise RuntimeError(f"Empirical bivariate checkpoint incomplete: {committed}/{total_units} units committed")
-        logger.info("BIVARIATE COMPLETE | %s | 100.00%% | %d/%d units", pair, committed, total_units)
-        return out_path
+                                # ... (ادامه‌ی کد) ...
+        # ... (بخش نهایی) ...
     finally:
         ds.close()
-
 # =============================================================================
 # 12. TESTS
 # =============================================================================
