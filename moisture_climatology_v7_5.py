@@ -100,7 +100,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("Moisture_Climatology_v7_4")
+logger = logging.getLogger("Moisture_Climatology_v7_5")
 
 # =============================================================================
 # 2. CONFIG / HASHING / PROVENANCE
@@ -403,28 +403,46 @@ def update_moments_4_order(
     M4: np.ndarray,
     x: np.ndarray,
     mask: np.ndarray,
+    *,
+    increment_n: bool = True,
 ) -> None:
+    """Update one variable's online moments using a shared paired-observation count.
+
+    When ``increment_n`` is True, the shared count ``n`` is advanced once.
+    Subsequent variables can use ``increment_n=False`` so the same observation
+    contributes to their moments without multiplying the shared count.
+    """
     idx = np.flatnonzero(mask)
     if idx.size == 0:
         return
-    n_old = n[idx].astype(np.float64)
+
+    n_current = n[idx].astype(np.float64)
+    n_old = n_current if increment_n else np.maximum(n_current - 1.0, 0.0)
+    n_new = n_old + 1.0
+
     x_obs = x[idx].astype(np.float64)
     mean_old = mean[idx]
     M2_old = M2[idx]
     M3_old = M3[idx]
     M4_old = M4[idx]
-    n_new = n_old + 1.0
+
     delta = x_obs - mean_old
     mean_new = mean_old + delta / n_new
     M2_new = M2_old + delta * (x_obs - mean_new)
-    M3_new = M3_old + delta**3 * n_old * (n_old - 1.0) / n_new**2 - 3.0 * delta * M2_old / n_new
+    M3_new = (
+        M3_old
+        + delta**3 * n_old * (n_old - 1.0) / n_new**2
+        - 3.0 * delta * M2_old / n_new
+    )
     M4_new = (
         M4_old
         + delta**4 * n_old * (n_old**2 - n_old + 1.0) / n_new**3
         + 6.0 * delta**2 * M2_old / n_new**2
         - 4.0 * delta * M3_old / n_new
     )
-    n[idx] = n_new.astype(np.int64)
+
+    if increment_n:
+        n[idx] = n_new.astype(np.int64)
     mean[idx] = mean_new
     M2[idx] = M2_new
     M3[idx] = M3_new
@@ -439,21 +457,34 @@ def update_covariance(
     x: np.ndarray,
     y: np.ndarray,
     mask: np.ndarray,
+    *,
+    increment_n: bool = True,
 ) -> None:
+    """Update covariance using a shared observation count.
+
+    With ``increment_n=False`` the covariance is aligned to the already-updated
+    shared count and therefore does not inflate the observation count.
+    """
     idx = np.flatnonzero(mask)
     if idx.size == 0:
         return
-    n_old = n_pair[idx].astype(np.float64)
+
+    n_current = n_pair[idx].astype(np.float64)
+    n_old = n_current if increment_n else np.maximum(n_current - 1.0, 0.0)
+    n_new = n_old + 1.0
+
     xo = x[idx].astype(np.float64)
     yo = y[idx].astype(np.float64)
     mx = mean_x[idx].astype(np.float64)
     my = mean_y[idx].astype(np.float64)
-    n_new = n_old + 1.0
+
     dx = xo - mx
     mx_new = mx + dx / n_new
     my_new = my + (yo - my) / n_new
     C_new = Cxy[idx] + dx * (yo - my_new)
-    n_pair[idx] = n_new.astype(np.int64)
+
+    if increment_n:
+        n_pair[idx] = n_new.astype(np.int64)
     mean_x[idx] = mx_new
     mean_y[idx] = my_new
     Cxy[idx] = C_new
@@ -709,6 +740,12 @@ def _write_daily_state(ds: Dataset, doy0: int, s: dict, j0: int, j1: int, i0: in
     ds.sync()
 
 
+def _safe_completed_flag(var, doy_index: int, y_chunk_index: int, x_chunk_index: int) -> int:
+    """Read a completion flag safely even when netCDF4 exposes an unset fill value as masked."""
+    raw = var[doy_index, y_chunk_index, x_chunk_index]
+    return int(np.ma.filled(raw, 0))
+
+
 def _read_progress(js_path: Path) -> dict:
     if not js_path.exists():
         return {}
@@ -818,8 +855,8 @@ def process_year_empirical(year: int) -> tuple[int, Optional[Path]]:
                         j1 = min(j0 + CHUNK_LAT, ny)
                         for xci, i0 in enumerate(range(0, nx, CHUNK_LON)):
                             i1 = min(i0 + CHUNK_LON, nx)
-                            flag = np.ma.filled(ds_ckpt.variables["completed_chunk"][cdoy - 1, yci, xci], 0)
-                            if int(flag) == 1:
+                            flag = _safe_completed_flag(ds_ckpt.variables["completed_chunk"], cdoy - 1, yci, xci)
+                            if flag == 1:
                                 slot_completed += 1
                                 continue
 
@@ -830,13 +867,28 @@ def process_year_empirical(year: int) -> tuple[int, Optional[Path]]:
                                 P = convert_pressure(ds_p["sp"].isel(time=int(ti), latitude=slice(j0, j1), longitude=slice(i0, i1)).values, pu, "sp").reshape(-1)
                                 phys = derive_moisture(T, Td, P)
                                 mask = phys["valid_all"]
-                                update_moments_4_order(s["n"], s["mean_rh"], s["M2_rh"], s["M3_rh"], s["M4_rh"], phys["rh"], mask)
-                                update_moments_4_order(s["n"], s["mean_e"], s["M2_e"], s["M3_e"], s["M4_e"], phys["e"], mask)
-                                update_moments_4_order(s["n"], s["mean_r"], s["M2_r"], s["M3_r"], s["M4_r"], phys["r"], mask)
-                                update_moments_4_order(s["n"], s["mean_q"], s["M2_q"], s["M3_q"], s["M4_q"], phys["q"], mask)
+                                update_moments_4_order(
+                                    s["n"], s["mean_rh"], s["M2_rh"], s["M3_rh"], s["M4_rh"],
+                                    phys["rh"], mask, increment_n=True
+                                )
+                                update_moments_4_order(
+                                    s["n"], s["mean_e"], s["M2_e"], s["M3_e"], s["M4_e"],
+                                    phys["e"], mask, increment_n=False
+                                )
+                                update_moments_4_order(
+                                    s["n"], s["mean_r"], s["M2_r"], s["M3_r"], s["M4_r"],
+                                    phys["r"], mask, increment_n=False
+                                )
+                                update_moments_4_order(
+                                    s["n"], s["mean_q"], s["M2_q"], s["M3_q"], s["M4_q"],
+                                    phys["q"], mask, increment_n=False
+                                )
                                 for xname, yname in BIVARIATE_PAIRS:
                                     tag = f"{xname}__{yname}"
-                                    update_covariance(s["n"], s[f"pair_{tag}_mean_x"], s[f"pair_{tag}_mean_y"], s[f"pair_{tag}_Cxy"], phys[xname], phys[yname], mask)
+                                    update_covariance(
+                                        s["n"], s[f"pair_{tag}_mean_x"], s[f"pair_{tag}_mean_y"], s[f"pair_{tag}_Cxy"],
+                                        phys[xname], phys[yname], mask, increment_n=False
+                                    )
                                 s["total_supersat"] += phys["supersat"].astype(np.int64)
                                 s["total_invalid_ep"] += phys["invalid_e_over_p"].astype(np.int64)
 
@@ -1093,7 +1145,7 @@ def finalize_all(years: Iterable[int], lat: np.ndarray, lon: np.ndarray) -> None
 
     manifest = {
         "project": "HumidClimatologyEngine",
-        "implementation": "moisture_climatology_v7_4.py",
+        "implementation": "moisture_climatology_v7_5.py",
         "schema_version": SCHEMA_VERSION,
         "config_hash": CONFIG_HASH,
         "script_sha256": script_sha256(),
