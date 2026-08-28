@@ -1700,3 +1700,30 @@ Hourly data -> Direct thermodynamic transformation -> Empirical climatology
 The project should prefer **evidence over a fixed distributional assumption**. The empirical 2-D product is the non-parametric reference; Normal, Skew-Normal, Pearson III, Beta, Bimodal Normal, and copula families are modelling candidates whose adequacy must be demonstrated for the relevant day, location, and scientific question.
 
 The README is intentionally explicit about what is implemented, what is a reference candidate, and what remains a second-pass orchestration task. That distinction is part of the scientific reproducibility contract.
+
+
+## v8.0 FINAL — Single-Pass Empirical Production Engine
+
+Version 8.0 introduces an engineering upgrade of the hourly empirical workflow.
+
+### Main improvements
+
+- Single-pass generation of the physical moisture variables and empirical products.
+- The RH–q bivariate empirical probability mass function is designed to be accumulated during the same hourly processing stream.
+- Avoids a second full ERA5-Land scan only for bivariate statistics.
+- Checkpoint architecture is extended for long production runs and restart safety.
+- Keeps the non-parametric empirical approach: no Gaussian assumption is imposed on joint moisture behaviour.
+
+### Production philosophy
+
+The engine separates:
+- physical conversion (T, Td, pressure → moisture variables),
+- online statistical accumulation,
+- empirical probability products,
+- final NetCDF publishing.
+
+The objective is a reproducible climate-processing workflow suitable for multi-decadal hourly ERA5-Land datasets.
+
+### Release note
+
+v8.0 is primarily an internal architecture and performance release. It improves scalability and computational efficiency rather than changing the scientific definition of the climatology.

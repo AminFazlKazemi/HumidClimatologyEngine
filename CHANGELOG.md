@@ -1,3 +1,7 @@
+# v8.0
+- Single-pass empirical production architecture.
+- Improved restart workflow.
+
 # Changelog
 
 ## 0.6.1
