@@ -1,0 +1,31 @@
+HumidClimatologyEngine v11.5 — Complete Public Release Contents
+
+ROOT
+- humid_climatology_engine_v11.5.py — primary production engine
+- README.md — primary public project documentation
+- CHANGELOG.md — release history
+- CITATION.cff — citation metadata
+- CONTRIBUTING.md — contribution workflow
+- environment.yml — conda environment definition
+- LICENSE — software license
+- MANIFEST.txt — package contents manifest
+- PROJECT_CONTENTS.txt — project contents and roles
+- pyproject.toml — project metadata and packaging configuration
+- RELEASE_MANIFEST.txt — release artifact manifest
+- requirements.txt — Python dependencies
+- SECURITY.md — security policy
+- .gitignore — repository ignore rules
+
+DOCUMENTATION
+- docs/README_DOCS.md
+- docs/HumidClimatologyEngine_v11.5_Comprehensive_Scientific_Engineering_Reference_FINAL.docx
+- docs/HumidClimatologyEngine_v11.5_Comprehensive_Scientific_Engineering_Reference_FINAL.pdf
+- docs/HumidClimatologyEngine_v8_vs_v11.5_Complete_Comparison.docx
+- docs/HumidClimatologyEngine_v11.5_User_Guide_and_Production_Runbook.docx
+- docs/HumidClimatologyEngine_v11.5_Who_Should_Use_It_and_Applications.docx
+- docs/HumidClimatologyEngine_v11.5_Analytical_Graphical_Comparison_Toolkit_Specification.docx
+
+HISTORICAL LINEAGE
+- v8 is retained as historical/educational reference.
+- Earlier v7.5/v10 materials may be archived for reproducibility.
+- The current public software identity is v11.5.

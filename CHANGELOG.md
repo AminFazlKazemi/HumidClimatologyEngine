@@ -1,8 +1,36 @@
-# v8.0
+# Changelog
+
+# v11.5 — Public Release
+
+## [11.5.0] - Public Release
+
+### Added
+- Direct hourly processing of ERA5-Land T2m, D2m and Surface Pressure.
+- Three temporal statistical levels: L1 daily pooled, L2 eight 3-hour bins, and L3 twenty-four hourly bins (33 bins total).
+- Empirical moisture products for RH, vapor pressure (e), mixing ratio (r), and specific humidity (q).
+- Online statistics through fourth order with counts, means, M2, M3, M4, extrema, missing counts and threshold counts.
+- Pair-specific dependence statistics and empirical RH × q joint histogram support.
+- Four decadal products plus FULL 1981–2020.
+- Transactional checkpointing, durable COMMITTED-state tracking, restart/recovery, audit and merge-audit workflows.
+- Detailed runtime progress reporting and real-data pilot execution.
+
+### Validation
+- D2m latitude-axis normalization to the T2m reference grid validated on real ERA5-Land input.
+- January 2011 full-month pilot: 31/31 days PASS.
+- Checkpoint flush PASS and checkpoint reopen PASS.
+
+### Documentation
+- Scientific and engineering reference, user/production runbook, v8 comparison, applications guide, analytical toolkit specification, and public README synchronized to v11.5.
+
+### Notes
+- v11.5 is the public release identity of HumidClimatologyEngine.
+- Historical v8/v10/v7.5 materials remain historical references and are not the current release identity.
+
+## [8.0.0] - Historical Release
 - Single-pass empirical production architecture.
 - Improved restart workflow.
 
-# Changelog
+## Historical packaging history
 
 ## 0.6.1
 - Production bug-fix release for the v6 engine.

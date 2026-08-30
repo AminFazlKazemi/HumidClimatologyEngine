@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ERA5-Land hourly empirical moisture climatology engine v7.5.
+"""ERA5-Land hourly empirical moisture climatology engine v8.0 fast optimization draft.
 
 Scientific contract
 -------------------
-v7.5 is a direct hourly empirical production engine. It does NOT use the v6 daily-statistic
+v8.0 FINAL SINGLE-PASS is a direct hourly empirical production engine. It does NOT use the v6 daily-statistic
 Gaussian/Monte-Carlo architecture for its primary moisture products.
 
 For each climatological DOY and grid cell, hourly T2m, D2m and surface pressure
@@ -54,44 +54,67 @@ def require_netcdf4() -> None:
         )
 
 # =============================================================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION – DECADE SETUP
 # =============================================================================
 
+# تنها چیزی که باید تغییر دهید این دو عدد است:
+DECADE_START = 2011   # سال شروع دهه (مثلاً 1981, 1991, 2001, 2011)
+DECADE_END   = 2020   # سال پایان دهه (مثلاً 1990, 2000, 2010, 2020)
+
+# تولید خودکار لیست سال‌ها برای PROCESS_YEARS
+PROCESS_YEARS_LIST = list(range(DECADE_START, DECADE_END + 1))
+# تنظیم متغیر محیطی برای پردازش فقط این دهه
+os.environ["PROCESS_YEARS"] = str(PROCESS_YEARS_LIST)
+# غیرفعال کردن قفل HDF5 (برای جلوگیری از خطاهای ویندوز)
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
+# تعیین START_YEAR و END_YEAR (برای سازگاری با بقیهٔ کد)
+START_YEAR = DECADE_START
+END_YEAR   = DECADE_END
+
+# مسیرهای ورودی (بدون تغییر)
 T2M_DIR = Path(r"F:\Kazemi\era5\land\T2m")
 D2M_DIR = Path(r"F:\Kazemi\era5\land\Dew_Point_Temperature")
-SP_DIR = Path(r"F:\Kazemi\era5\land\Surface_Pressure")
+SP_DIR  = Path(r"F:\Kazemi\era5\land\Surface_Pressure")
 OUTPUT_DIR = Path(r"C:\c")
 
-CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints_moisture_v7_5"
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints_moisture_v8_0"
 YEAR_DIR = CHECKPOINT_DIR / "years"
-RUN_MANIFEST_FILE = OUTPUT_DIR / "moisture_climatology_run_manifest_v7_5.json"
+RUN_MANIFEST_FILE = OUTPUT_DIR / "moisture_climatology_run_manifest_v8_0.json"
 
-START_YEAR = 1981
-END_YEAR = 2020
 DOY_COUNT = 366
 
-MAX_WORKERS = 2
-CHUNK_LAT = 32
-CHUNK_LON = 64
+MAX_WORKERS = 1  # برای جلوگیری از خطاهای HDF، ترتیبی
+CHUNK_LAT = 64
+CHUNK_LON = 128
 PROGRESS_FLUSH_CHUNKS = 16
 PROGRESS_LOG_EVERY_CHUNKS = 8
 PROGRESS_REFRESH_SECONDS = 5.0
 
-SCHEMA_VERSION = "7.5"
-CHECKPOINT_VERSION = "7.5"
+SCHEMA_VERSION = "8.0"
+CHECKPOINT_VERSION = "8.0-FINAL-SINGLE-PASS"
 
-# Primary pairwise probability-function parameterizations.
-# Additional pairs can be added without changing the primary marginal statistics.
 BIVARIATE_PAIRS = (("rh", "q"),)
 BIVARIATE_NX = 8
 BIVARIATE_NY = 8
 BUILD_EMPIRICAL_BIVARIATE = True
-BIVARIATE_CHECKPOINT_FILE = CHECKPOINT_DIR / "bivariate_progress_v7_5.json"
 
-OUTPUT_FILE = OUTPUT_DIR / "moisture_climatology_1981_2020_v7_5.nc"
-DIAGNOSTIC_FILE = OUTPUT_DIR / "moisture_climatology_diagnostics_1981_2020_v7_5.nc"
-BIVARIATE_FILE = OUTPUT_DIR / "moisture_climatology_bivariate_1981_2020_v7_5.nc"
+V8_FAST_FEATURES = {"optimized_chunks": True, "automatic_workers": True, "single_pass_bivariate_target": True}
+BIVARIATE_CHECKPOINT_FILE = CHECKPOINT_DIR / "bivariate_progress_v8_0.json"
 
+# -------------------------------------------------------------------------
+# نام فایل‌های خروجی – بر اساس دهه به‌طور خودکار ساخته می‌شوند
+# -------------------------------------------------------------------------
+def decade_label(start, end):
+    return f"{start}_{end}"
+
+_label = decade_label(DECADE_START, DECADE_END)
+
+OUTPUT_FILE   = OUTPUT_DIR / f"moisture_climatology_{_label}_v8_0.nc"
+DIAGNOSTIC_FILE = OUTPUT_DIR / f"moisture_climatology_diagnostics_{_label}_v8_0.nc"
+BIVARIATE_FILE = OUTPUT_DIR / f"moisture_climatology_bivariate_{_label}_v8_0.nc"
+
+# ایجاد پوشه‌ها
 for _d in (OUTPUT_DIR, CHECKPOINT_DIR, YEAR_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
@@ -100,7 +123,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("Moisture_Climatology_v7_4")
+logger = logging.getLogger("Moisture_Climatology_v8_0")
 
 # =============================================================================
 # 2. CONFIG / HASHING / PROVENANCE
@@ -144,6 +167,14 @@ def hash_dict(data: dict) -> str:
 
 
 CONFIG_HASH = hash_dict(asdict(CONFIG))
+
+# متغیر محیطی PROCESS_YEARS قبلاً تنظیم شده است
+import ast
+_process_years_env = os.environ.get("PROCESS_YEARS")
+if _process_years_env:
+    PROCESS_YEARS = set(ast.literal_eval(_process_years_env))
+else:
+    PROCESS_YEARS = None
 
 
 def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
@@ -403,28 +434,46 @@ def update_moments_4_order(
     M4: np.ndarray,
     x: np.ndarray,
     mask: np.ndarray,
+    *,
+    increment_n: bool = True,
 ) -> None:
+    """Update one variable's online moments using a shared paired-observation count.
+
+    When ``increment_n`` is True, the shared count ``n`` is advanced once.
+    Subsequent variables can use ``increment_n=False`` so the same observation
+    contributes to their moments without multiplying the shared count.
+    """
     idx = np.flatnonzero(mask)
     if idx.size == 0:
         return
-    n_old = n[idx].astype(np.float64)
+
+    n_current = n[idx].astype(np.float64)
+    n_old = n_current if increment_n else np.maximum(n_current - 1.0, 0.0)
+    n_new = n_old + 1.0
+
     x_obs = x[idx].astype(np.float64)
     mean_old = mean[idx]
     M2_old = M2[idx]
     M3_old = M3[idx]
     M4_old = M4[idx]
-    n_new = n_old + 1.0
+
     delta = x_obs - mean_old
     mean_new = mean_old + delta / n_new
     M2_new = M2_old + delta * (x_obs - mean_new)
-    M3_new = M3_old + delta**3 * n_old * (n_old - 1.0) / n_new**2 - 3.0 * delta * M2_old / n_new
+    M3_new = (
+        M3_old
+        + delta**3 * n_old * (n_old - 1.0) / n_new**2
+        - 3.0 * delta * M2_old / n_new
+    )
     M4_new = (
         M4_old
         + delta**4 * n_old * (n_old**2 - n_old + 1.0) / n_new**3
         + 6.0 * delta**2 * M2_old / n_new**2
         - 4.0 * delta * M3_old / n_new
     )
-    n[idx] = n_new.astype(np.int64)
+
+    if increment_n:
+        n[idx] = n_new.astype(np.int64)
     mean[idx] = mean_new
     M2[idx] = M2_new
     M3[idx] = M3_new
@@ -439,21 +488,34 @@ def update_covariance(
     x: np.ndarray,
     y: np.ndarray,
     mask: np.ndarray,
+    *,
+    increment_n: bool = True,
 ) -> None:
+    """Update covariance using a shared observation count.
+
+    With ``increment_n=False`` the covariance is aligned to the already-updated
+    shared count and therefore does not inflate the observation count.
+    """
     idx = np.flatnonzero(mask)
     if idx.size == 0:
         return
-    n_old = n_pair[idx].astype(np.float64)
+
+    n_current = n_pair[idx].astype(np.float64)
+    n_old = n_current if increment_n else np.maximum(n_current - 1.0, 0.0)
+    n_new = n_old + 1.0
+
     xo = x[idx].astype(np.float64)
     yo = y[idx].astype(np.float64)
     mx = mean_x[idx].astype(np.float64)
     my = mean_y[idx].astype(np.float64)
-    n_new = n_old + 1.0
+
     dx = xo - mx
     mx_new = mx + dx / n_new
     my_new = my + (yo - my) / n_new
     C_new = Cxy[idx] + dx * (yo - my_new)
-    n_pair[idx] = n_new.astype(np.int64)
+
+    if increment_n:
+        n_pair[idx] = n_new.astype(np.int64)
     mean_x[idx] = mx_new
     mean_y[idx] = my_new
     Cxy[idx] = C_new
@@ -561,6 +623,18 @@ def empirical_bivariate_histogram(values_x: np.ndarray, values_y: np.ndarray,
         raise OverflowError("Bivariate histogram count exceeds uint16 capacity; use a larger integer dtype.")
     return counts.reshape(len(x_edges)-1,len(y_edges)-1).astype(np.uint16), int(mask.sum())
 
+def update_empirical_histogram_inplace(hist: np.ndarray, x: np.ndarray, y: np.ndarray) -> None:
+    """v8 FINAL single-pass exact RH-q empirical histogram update."""
+    x=np.asarray(x,dtype=np.float64).reshape(-1)
+    y=np.asarray(y,dtype=np.float64).reshape(-1)
+    valid=np.isfinite(x)&np.isfinite(y)&(x>=0)&(x<=100)&(y>=0)&(y<=1)
+    if not np.any(valid):
+        return
+    ix=np.clip((x[valid] / 100.0 * BIVARIATE_NX).astype(np.int64),0,BIVARIATE_NX-1)
+    iy=np.clip((y[valid] * BIVARIATE_NY).astype(np.int64),0,BIVARIATE_NY-1)
+    hist += np.bincount(ix*BIVARIATE_NY+iy, minlength=BIVARIATE_NX*BIVARIATE_NY).reshape(BIVARIATE_NX,BIVARIATE_NY)
+
+
 def empirical_bivariate_pdf(x: np.ndarray | float, y: np.ndarray | float,
                             counts: np.ndarray, n_valid: np.ndarray | int,
                             x_edges: np.ndarray, y_edges: np.ndarray) -> np.ndarray | float:
@@ -581,7 +655,7 @@ def bivariate_gaussian_pdf(
     std_x: np.ndarray | float, mean_y: np.ndarray | float, std_y: np.ndarray | float,
     rho: np.ndarray | float,
 ) -> np.ndarray | float:
-    """Reference parametric candidate only; v7.5 does not assume Gaussianity."""
+    """Reference parametric candidate only; v8.0 FINAL SINGLE-PASS does not assume Gaussianity."""
     x, y, mx, sx, my, sy, r = np.broadcast_arrays(
         np.asarray(x,dtype=float), np.asarray(y,dtype=float), np.asarray(mean_x,dtype=float),
         np.asarray(std_x,dtype=float), np.asarray(mean_y,dtype=float), np.asarray(std_y,dtype=float), np.asarray(rho,dtype=float))
@@ -637,6 +711,8 @@ def create_year_checkpoint(path: Path, lat: np.ndarray, lon: np.ndarray) -> Data
     ds.createDimension("doy", DOY_COUNT)
     ds.createDimension("latitude", len(lat))
     ds.createDimension("longitude", len(lon))
+    ds.createDimension("rh_bin", BIVARIATE_NX)
+    ds.createDimension("q_bin", BIVARIATE_NY)
     ds.createDimension("y_chunk", (len(lat) + CHUNK_LAT - 1) // CHUNK_LAT)
     ds.createDimension("x_chunk", (len(lon) + CHUNK_LON - 1) // CHUNK_LON)
     ds.createVariable("doy", "i2", ("doy",))[:] = np.arange(1, DOY_COUNT + 1, dtype=np.int16)
@@ -665,6 +741,10 @@ def create_year_checkpoint(path: Path, lat: np.ndarray, lon: np.ndarray) -> Data
         for field in ("mean_x", "mean_y", "Cxy"):
             ds.createVariable(f"pair_{tag}_{field}", "f8", ("doy", "latitude", "longitude"),
                               zlib=True, complevel=4, shuffle=True, chunksizes=chunks, fill_value=0.0)
+        # v8 FINAL: exact empirical histogram accumulated in the same hourly pass
+        ds.createVariable(f"pair_{tag}_hist", "i8",
+                          ("doy", "latitude", "longitude", "rh_bin", "q_bin"),
+                          zlib=True, complevel=4, shuffle=True, fill_value=0)
 
     ds.schema_version = CHECKPOINT_VERSION
     ds.config_hash = CONFIG_HASH
@@ -691,6 +771,7 @@ def _empty_daily_states(ncells: int) -> dict:
         out[f"pair_{tag}_mean_x"] = np.zeros(ncells, np.float64)
         out[f"pair_{tag}_mean_y"] = np.zeros(ncells, np.float64)
         out[f"pair_{tag}_Cxy"] = np.zeros(ncells, np.float64)
+        out[f"pair_{tag}_hist"] = np.zeros((ncells, BIVARIATE_NX, BIVARIATE_NY), np.int64)
     return out
 
 
@@ -706,7 +787,14 @@ def _write_daily_state(ds: Dataset, doy0: int, s: dict, j0: int, j1: int, i0: in
         ds.variables[f"pair_{tag}_mean_x"][doy0, j0:j1, i0:i1] = s[f"pair_{tag}_mean_x"].reshape(j1 - j0, i1 - i0)
         ds.variables[f"pair_{tag}_mean_y"][doy0, j0:j1, i0:i1] = s[f"pair_{tag}_mean_y"].reshape(j1 - j0, i1 - i0)
         ds.variables[f"pair_{tag}_Cxy"][doy0, j0:j1, i0:i1] = s[f"pair_{tag}_Cxy"].reshape(j1 - j0, i1 - i0)
+        ds.variables[f"pair_{tag}_hist"][doy0, j0:j1, i0:i1, :, :] = s[f"pair_{tag}_hist"].reshape(j1-j0, i1-i0, BIVARIATE_NX, BIVARIATE_NY)
     ds.sync()
+
+
+def _safe_completed_flag(var, doy_index: int, y_chunk_index: int, x_chunk_index: int) -> int:
+    """Read a completion flag safely even when netCDF4 exposes an unset fill value as masked."""
+    raw = var[doy_index, y_chunk_index, x_chunk_index]
+    return int(np.ma.filled(raw, 0))
 
 
 def _read_progress(js_path: Path) -> dict:
@@ -818,7 +906,8 @@ def process_year_empirical(year: int) -> tuple[int, Optional[Path]]:
                         j1 = min(j0 + CHUNK_LAT, ny)
                         for xci, i0 in enumerate(range(0, nx, CHUNK_LON)):
                             i1 = min(i0 + CHUNK_LON, nx)
-                            if int(ds_ckpt.variables["completed_chunk"][cdoy - 1, yci, xci]) == 1:
+                            flag = _safe_completed_flag(ds_ckpt.variables["completed_chunk"], cdoy - 1, yci, xci)
+                            if flag == 1:
                                 slot_completed += 1
                                 continue
 
@@ -829,19 +918,44 @@ def process_year_empirical(year: int) -> tuple[int, Optional[Path]]:
                                 P = convert_pressure(ds_p["sp"].isel(time=int(ti), latitude=slice(j0, j1), longitude=slice(i0, i1)).values, pu, "sp").reshape(-1)
                                 phys = derive_moisture(T, Td, P)
                                 mask = phys["valid_all"]
-                                update_moments_4_order(s["n"], s["mean_rh"], s["M2_rh"], s["M3_rh"], s["M4_rh"], phys["rh"], mask)
-                                update_moments_4_order(s["n"], s["mean_e"], s["M2_e"], s["M3_e"], s["M4_e"], phys["e"], mask)
-                                update_moments_4_order(s["n"], s["mean_r"], s["M2_r"], s["M3_r"], s["M4_r"], phys["r"], mask)
-                                update_moments_4_order(s["n"], s["mean_q"], s["M2_q"], s["M3_q"], s["M4_q"], phys["q"], mask)
+                                update_moments_4_order(
+                                    s["n"], s["mean_rh"], s["M2_rh"], s["M3_rh"], s["M4_rh"],
+                                    phys["rh"], mask, increment_n=True
+                                )
+                                update_moments_4_order(
+                                    s["n"], s["mean_e"], s["M2_e"], s["M3_e"], s["M4_e"],
+                                    phys["e"], mask, increment_n=False
+                                )
+                                update_moments_4_order(
+                                    s["n"], s["mean_r"], s["M2_r"], s["M3_r"], s["M4_r"],
+                                    phys["r"], mask, increment_n=False
+                                )
+                                update_moments_4_order(
+                                    s["n"], s["mean_q"], s["M2_q"], s["M3_q"], s["M4_q"],
+                                    phys["q"], mask, increment_n=False
+                                )
                                 for xname, yname in BIVARIATE_PAIRS:
                                     tag = f"{xname}__{yname}"
-                                    update_covariance(s["n"], s[f"pair_{tag}_mean_x"], s[f"pair_{tag}_mean_y"], s[f"pair_{tag}_Cxy"], phys[xname], phys[yname], mask)
+                                    update_covariance(
+                                        s["n"], s[f"pair_{tag}_mean_x"], s[f"pair_{tag}_mean_y"], s[f"pair_{tag}_Cxy"],
+                                        phys[xname], phys[yname], mask, increment_n=False
+                                    )
+                                    # exact empirical PDF counts, accumulated once only
+                                    flat_hist = s[f"pair_{tag}_hist"]
+                                    h = flat_hist.reshape(-1, BIVARIATE_NX, BIVARIATE_NY)
+                                    valid_idx = np.flatnonzero(mask)
+                                    if valid_idx.size:
+                                        xx = phys[xname][valid_idx]
+                                        yy = phys[yname][valid_idx]
+                                        bins_x = np.clip((xx/100.0*BIVARIATE_NX).astype(np.int64),0,BIVARIATE_NX-1)
+                                        bins_y = np.clip((yy*BIVARIATE_NY).astype(np.int64),0,BIVARIATE_NY-1)
+                                        np.add.at(h, (valid_idx, bins_x, bins_y), 1)
                                 s["total_supersat"] += phys["supersat"].astype(np.int64)
                                 s["total_invalid_ep"] += phys["invalid_e_over_p"].astype(np.int64)
 
                             _write_daily_state(ds_ckpt, cdoy - 1, s, j0, j1, i0, i1)
                             ds_ckpt.variables["completed_chunk"][cdoy - 1, yci, xci] = 1
-                            ds_ckpt.sync()
+                            # ds_ckpt.sync()  # حذف شد؛ فقط بعد از اتمام روز sync می‌کنیم
                             completed_units += 1
                             slot_completed += 1
                             if slot_completed % PROGRESS_LOG_EVERY_CHUNKS == 0 or slot_completed == n_y_chunks * n_x_chunks:
@@ -851,6 +965,9 @@ def process_year_empirical(year: int) -> tuple[int, Optional[Path]]:
                                     json_path, year=year, ny=ny, nx=nx, completed_dates=completed_dates,
                                     completed_units=completed_units, total_units=total_units, last_doy=cdoy,
                                 )
+
+                    # پس از پردازش تمام بلوک‌های این روز، یک بار sync می‌کنیم
+                    ds_ckpt.sync()
 
                     # A climatological slot is complete only after every spatial chunk is committed.
                     if slot_completed == n_y_chunks * n_x_chunks:
@@ -907,6 +1024,8 @@ def create_output_file(path: Path, lat: np.ndarray, lon: np.ndarray, title: str)
     ds.createDimension("doy", DOY_COUNT)
     ds.createDimension("latitude", len(lat))
     ds.createDimension("longitude", len(lon))
+    ds.createDimension("rh_bin", BIVARIATE_NX)
+    ds.createDimension("q_bin", BIVARIATE_NY)
     ds.createVariable("doy", "i2", ("doy",))[:] = np.arange(1, DOY_COUNT + 1, dtype=np.int16)
     ds.createVariable("latitude", "f4", ("latitude",))[:] = lat.astype(np.float32)
     ds.createVariable("longitude", "f4", ("longitude",))[:] = lon.astype(np.float32)
@@ -948,9 +1067,10 @@ def stats_from_state(n: np.ndarray, mean: np.ndarray, M2: np.ndarray, M3: np.nda
 # =============================================================================
 
 def finalize_all(years: Iterable[int], lat: np.ndarray, lon: np.ndarray) -> None:
-    main = create_output_file(OUTPUT_FILE, lat, lon, "ERA5-Land Moisture Climatology 1981-2020 (v7.5 hourly empirical)")
-    diag = create_output_file(DIAGNOSTIC_FILE, lat, lon, "ERA5-Land Moisture Diagnostics 1981-2020 (v7.5)")
-    biv = create_output_file(BIVARIATE_FILE, lat, lon, "ERA5-Land Bivariate Probability Parameters 1981-2020 (v7.5)")
+    # برای دهه‌های مختلف، نام فایل‌ها قبلاً بر اساس label تنظیم شده‌اند
+    main = create_output_file(OUTPUT_FILE, lat, lon, f"ERA5-Land Moisture Climatology {DECADE_START}-{DECADE_END} (v8.0 FINAL SINGLE-PASS hourly empirical)")
+    diag = create_output_file(DIAGNOSTIC_FILE, lat, lon, f"ERA5-Land Moisture Diagnostics {DECADE_START}-{DECADE_END} (v8.0 FINAL SINGLE-PASS)")
+    biv = create_output_file(BIVARIATE_FILE, lat, lon, f"ERA5-Land Bivariate Probability Parameters {DECADE_START}-{DECADE_END} (v8.0 FINAL SINGLE-PASS)")
 
     out_chunks = (1, min(CHUNK_LAT, len(lat)), min(CHUNK_LON, len(lon)))
     for key in ("rh", "e", "r", "q"):
@@ -1092,7 +1212,7 @@ def finalize_all(years: Iterable[int], lat: np.ndarray, lon: np.ndarray) -> None
 
     manifest = {
         "project": "HumidClimatologyEngine",
-        "implementation": "moisture_climatology_v7_4.py",
+        "implementation": "moisture_climatology_v8_0.py",
         "schema_version": SCHEMA_VERSION,
         "config_hash": CONFIG_HASH,
         "script_sha256": script_sha256(),
@@ -1115,10 +1235,12 @@ def finalize_all(years: Iterable[int], lat: np.ndarray, lon: np.ndarray) -> None
 # =============================================================================
 
 def _bivariate_output_path(pair: tuple[str,str]) -> Path:
-    return OUTPUT_DIR / f"moisture_bivariate_empirical_{pair[0]}__{pair[1]}_1981_2020_v7_5.nc"
+    # نام فایل هیستوگرام تجربی را بر اساس دهه تنظیم می‌کنیم
+    label = f"{DECADE_START}_{DECADE_END}"
+    return OUTPUT_DIR / f"moisture_bivariate_empirical_{pair[0]}__{pair[1]}_{label}_v8_0.nc"
 
 def _bivariate_pair_progress_path(pair: tuple[str,str]) -> Path:
-    return CHECKPOINT_DIR / f"bivariate_{pair[0]}__{pair[1]}_progress_v7_5.json"
+    return CHECKPOINT_DIR / f"bivariate_{pair[0]}__{pair[1]}_progress_v8_0.json"
 
 def _bivariate_progress_read(path: Path) -> dict:
     if not path.exists(): return {}
@@ -1126,12 +1248,9 @@ def _bivariate_progress_read(path: Path) -> dict:
     except Exception: return {}
 
 def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat: np.ndarray, lon: np.ndarray) -> Path:
-    """Build a restartable empirical 2-D PDF with a single-file transaction state.
+    """ساخت یا ادامه‌ی ساخت PDF دوبعدی تجربی برای یک جفت متغیر.
 
-    For each DOY x spatial chunk, ``next_year`` records the first year index that
-    still needs to be accumulated. The histogram counts and ``next_year`` are
-    written to the same NetCDF and synchronized together, so a power failure
-    cannot create a durable count update without its corresponding progress state.
+    از چک‌پوینت داخلی (next_year) برای ادامه از نقطه‌ی قطع استفاده می‌کند.
     """
     require_netcdf4()
     xname, yname = pair
@@ -1143,6 +1262,7 @@ def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat:
     n_y_chunks, n_x_chunks = len(y_ranges), len(x_ranges)
     total_units = DOY_COUNT * n_y_chunks * n_x_chunks
 
+    # باز کردن یا ایجاد فایل خروجی
     if out_path.exists():
         ds = Dataset(out_path, "r+")
     else:
@@ -1154,6 +1274,7 @@ def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat:
         ds.createDimension("x_chunk", n_x_chunks)
         ds.createDimension("x_bin", BIVARIATE_NX)
         ds.createDimension("y_bin", BIVARIATE_NY)
+
         ds.createVariable("doy", "i2", ("doy",))[:] = np.arange(1, DOY_COUNT + 1, dtype=np.int16)
         ds.createVariable("latitude", "f4", ("latitude",))[:] = lat.astype(np.float32)
         ds.createVariable("longitude", "f4", ("longitude",))[:] = lon.astype(np.float32)
@@ -1161,6 +1282,7 @@ def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat:
         ds.createVariable("x_bin_right", "f8", ("x_bin",))[:] = x_edges[1:]
         ds.createVariable("y_bin_left", "f8", ("y_bin",))[:] = y_edges[:-1]
         ds.createVariable("y_bin_right", "f8", ("y_bin",))[:] = y_edges[1:]
+
         chunks = (1, min(CHUNK_LAT, ny), min(CHUNK_LON, nx), BIVARIATE_NX, BIVARIATE_NY)
         ds.createVariable("count", "u2", ("doy", "latitude", "longitude", "x_bin", "y_bin"),
                           zlib=True, complevel=4, shuffle=True, chunksizes=chunks, fill_value=0)
@@ -1169,6 +1291,7 @@ def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat:
                           chunksizes=(1, min(CHUNK_LAT, ny), min(CHUNK_LON, nx)), fill_value=0)
         ds.createVariable("next_year", "i2", ("doy", "y_chunk", "x_chunk"),
                           zlib=True, complevel=4, fill_value=0)
+
         ds.purpose = "Empirical 2-D piecewise-constant PDF from hourly observations; no Gaussian assumption"
         ds.pair = f"{xname}__{yname}"
         ds.schema_version = SCHEMA_VERSION
@@ -1181,84 +1304,139 @@ def build_empirical_bivariate_pair(pair: tuple[str, str], years: list[int], lat:
         ds.restart_definition = "next_year[yday,y_chunk,x_chunk] is committed transactionally with count/n_valid"
         ds.sync()
 
-    indices = {year: (build_file_index(year, T2M_DIR), build_file_index(year, D2M_DIR), build_file_index(year, SP_DIR))
+    indices = {year: (build_file_index(year, T2M_DIR),
+                      build_file_index(year, D2M_DIR),
+                      build_file_index(year, SP_DIR))
                for year in years}
     year_pos = {year: pos for pos, year in enumerate(years)}
 
     try:
-        next_year = np.asarray(ds.variables["next_year"][:], dtype=np.int16)
-        done_units = int(np.count_nonzero(next_year >= len(years)) if DOY_COUNT else 0)
-        logger.info("BIVARIATE START | %s | empirical 2-D PDF | committed units %d/%d", pair, done_units, total_units)
+        next_year_data = ds.variables["next_year"][:]
+        next_year_filled = np.ma.filled(next_year_data, 0).astype(np.int16)
+        done_units = int(np.count_nonzero(next_year_filled >= len(years)) if DOY_COUNT else 0)
+        logger.info("BIVARIATE START | %s | empirical 2-D PDF | committed units %d/%d",
+                    pair, done_units, total_units)
 
         for year in years:
             yi = year_pos[year]
             t_idx, d_idx, p_idx = indices[year]
+
             for month in range(1, 13):
                 with open_dataset(t_idx[month]) as dt, open_dataset(d_idx[month]) as dd, open_dataset(p_idx[month]) as dp:
-                    dt = sort_dataset(dt); dd = sort_dataset(dd); dp = sort_dataset(dp)
+                    dt = sort_dataset(dt)
+                    dd = sort_dataset(dd)
+                    dp = sort_dataset(dp)
                     validate_grids_and_axes(dt, dd, dp, year, month)
-                    tu = dt["t2m"].attrs.get("units"); du = dd["d2m"].attrs.get("units"); pu = dp["sp"].attrs.get("units")
-                    native = dt.time.dt.dayofyear.values.astype(np.int16)
-                    cdoys = sorted(set(get_clim_doy(int(d), year) for d in native if get_clim_doy(int(d), year) not in (-1, 59)))
+
+                    tu = dt["t2m"].attrs.get("units")
+                    du = dd["d2m"].attrs.get("units")
+                    pu = dp["sp"].attrs.get("units")
+
+                    native_doys = dt.time.dt.dayofyear.values.astype(np.int16)
+                    cdoys = sorted({
+                        get_clim_doy(int(d), year)
+                        for d in native_doys
+                        if get_clim_doy(int(d), year) not in (-1, 59)
+                    })
 
                     for cdoy in cdoys:
-                        time_idx = np.flatnonzero(np.array([get_clim_doy(int(d), year) == cdoy for d in native], dtype=bool))
-                        if not time_idx.size:
+                        time_idx = np.flatnonzero([
+                            get_clim_doy(int(d), year) == cdoy
+                            for d in native_doys
+                        ])
+                        if time_idx.size == 0:
                             continue
+
                         for yci, j0 in enumerate(y_ranges):
                             j1 = min(j0 + CHUNK_LAT, ny)
                             for xci, i0 in enumerate(x_ranges):
                                 i1 = min(i0 + CHUNK_LON, nx)
-                                if int(ds.variables["next_year"][cdoy-1, yci, xci]) >= yi + 1:
+
+                                raw_val = ds.variables["next_year"][cdoy - 1, yci, xci]
+                                current_progress = int(np.ma.filled(raw_val, 0))
+                                if current_progress >= yi + 1:
                                     continue
 
                                 cells = (j1 - j0) * (i1 - i0)
                                 counts = np.zeros((cells, BIVARIATE_NX, BIVARIATE_NY), dtype=np.uint32)
                                 nvalid = np.zeros(cells, dtype=np.uint32)
+
                                 for ti in time_idx:
-                                    T = convert_temperature(dt["t2m"].isel(time=int(ti), latitude=slice(j0,j1), longitude=slice(i0,i1)).values, tu, "t2m")
-                                    Td = convert_temperature(dd["d2m"].isel(time=int(ti), latitude=slice(j0,j1), longitude=slice(i0,i1)).values, du, "d2m")
-                                    P = convert_pressure(dp["sp"].isel(time=int(ti), latitude=slice(j0,j1), longitude=slice(i0,i1)).values, pu, "sp")
-                                    ph = derive_moisture(T.reshape(-1), Td.reshape(-1), P.reshape(-1))
+                                    T = convert_temperature(
+                                        dt["t2m"].isel(time=int(ti), latitude=slice(j0, j1), longitude=slice(i0, i1)).values,
+                                        tu, "t2m"
+                                    ).reshape(-1)
+                                    Td = convert_temperature(
+                                        dd["d2m"].isel(time=int(ti), latitude=slice(j0, j1), longitude=slice(i0, i1)).values,
+                                        du, "d2m"
+                                    ).reshape(-1)
+                                    P = convert_pressure(
+                                        dp["sp"].isel(time=int(ti), latitude=slice(j0, j1), longitude=slice(i0, i1)).values,
+                                        pu, "sp"
+                                    ).reshape(-1)
+
+                                    ph = derive_moisture(T, Td, P)
                                     xv = np.asarray(ph[xname], dtype=np.float64).reshape(-1)
                                     yv = np.asarray(ph[yname], dtype=np.float64).reshape(-1)
+
                                     valid = np.isfinite(xv) & np.isfinite(yv)
-                                    valid &= (xv >= x_edges[0]) & (xv <= x_edges[-1]) & (yv >= y_edges[0]) & (yv <= y_edges[-1])
-                                    idx = np.flatnonzero(valid)
-                                    if idx.size == 0:
+                                    valid &= (xv >= x_edges[0]) & (xv <= x_edges[-1])
+                                    valid &= (yv >= y_edges[0]) & (yv <= y_edges[-1])
+
+                                    idx_valid = np.flatnonzero(valid)
+                                    if idx_valid.size == 0:
                                         continue
-                                    xx = xv[idx]; yy = yv[idx]
+
+                                    xx = xv[idx_valid]
+                                    yy = yv[idx_valid]
                                     ix = np.searchsorted(x_edges, xx, side="right") - 1
                                     iy = np.searchsorted(y_edges, yy, side="right") - 1
-                                    ix = np.minimum(ix, BIVARIATE_NX - 1); iy = np.minimum(iy, BIVARIATE_NY - 1)
-                                    np.add.at(nvalid, idx, 1)
-                                    np.add.at(counts, (idx, ix, iy), 1)
+                                    ix = np.minimum(ix, BIVARIATE_NX - 1)
+                                    iy = np.minimum(iy, BIVARIATE_NY - 1)
 
-                                old_counts = np.asarray(ds.variables["count"][cdoy-1,j0:j1,i0:i1,:,:], dtype=np.uint32).reshape(cells,BIVARIATE_NX,BIVARIATE_NY)
-                                old_n = np.asarray(ds.variables["n_valid"][cdoy-1,j0:j1,i0:i1], dtype=np.uint32).reshape(-1)
+                                    np.add.at(nvalid, idx_valid, 1)
+                                    np.add.at(counts, (idx_valid, ix, iy), 1)
+
+                                old_counts = np.asarray(
+                                    ds.variables["count"][cdoy - 1, j0:j1, i0:i1, :, :],
+                                    dtype=np.uint32
+                                ).reshape(cells, BIVARIATE_NX, BIVARIATE_NY)
+                                old_n = np.asarray(
+                                    ds.variables["n_valid"][cdoy - 1, j0:j1, i0:i1],
+                                    dtype=np.uint32
+                                ).reshape(-1)
+
                                 merged_counts = old_counts + counts
                                 merged_n = old_n + nvalid
-                                if merged_counts.max(initial=0) > np.iinfo(np.uint16).max or merged_n.max(initial=0) > np.iinfo(np.uint16).max:
+
+                                if merged_counts.max(initial=0) > np.iinfo(np.uint16).max or \
+                                   merged_n.max(initial=0) > np.iinfo(np.uint16).max:
                                     raise OverflowError("Empirical bivariate histogram exceeds uint16 capacity.")
 
-                                # Transaction: data + progress state are synchronized together.
-                                ds.variables["count"][cdoy-1,j0:j1,i0:i1,:,:] = merged_counts.astype(np.uint16).reshape(j1-j0,i1-i0,BIVARIATE_NX,BIVARIATE_NY)
-                                ds.variables["n_valid"][cdoy-1,j0:j1,i0:i1] = merged_n.astype(np.uint16).reshape(j1-j0,i1-i0)
-                                ds.variables["next_year"][cdoy-1,yci,xci] = yi + 1
+                                ds.variables["count"][cdoy - 1, j0:j1, i0:i1, :, :] = \
+                                    merged_counts.astype(np.uint16).reshape(j1 - j0, i1 - i0, BIVARIATE_NX, BIVARIATE_NY)
+                                ds.variables["n_valid"][cdoy - 1, j0:j1, i0:i1] = \
+                                    merged_n.astype(np.uint16).reshape(j1 - j0, i1 - i0)
+                                ds.variables["next_year"][cdoy - 1, yci, xci] = yi + 1
                                 ds.sync()
 
-                                # Recompute compact progress count periodically; no separate progress truth exists.
-                                if (yi == len(years)-1) and ((cdoy % 10 == 0) or (cdoy == DOY_COUNT-1 and xci == len(x_ranges)-1 and yci == len(y_ranges)-1)):
-                                    committed = int(np.count_nonzero(np.asarray(ds.variables["next_year"][:]) >= len(years)))
+                                if (yi == len(years) - 1) and \
+                                   ((cdoy % 10 == 0) or
+                                    (cdoy == DOY_COUNT - 1 and xci == len(x_ranges) - 1 and yci == len(y_ranges) - 1)):
+                                    next_year_filled = np.ma.filled(ds.variables["next_year"][:], 0).astype(np.int16)
+                                    committed = int(np.count_nonzero(next_year_filled >= len(years)))
                                     pct = 100.0 * committed / max(total_units, 1)
                                     logger.info("BIVARIATE PROGRESS | %s | %.2f%% | %d/%d spatial-day units | remaining %d | through year %d",
-                                                pair, pct, committed, total_units, total_units-committed, year)
+                                                pair, pct, committed, total_units, total_units - committed, year)
 
-        committed = int(np.count_nonzero(np.asarray(ds.variables["next_year"][:]) >= len(years)))
+        next_year_filled = np.ma.filled(ds.variables["next_year"][:], 0).astype(np.int16)
+        committed = int(np.count_nonzero(next_year_filled >= len(years)))
         if committed != total_units:
             raise RuntimeError(f"Empirical bivariate checkpoint incomplete: {committed}/{total_units} units committed")
         logger.info("BIVARIATE COMPLETE | %s | 100.00%% | %d/%d units", pair, committed, total_units)
+
         return out_path
+
     finally:
         ds.close()
 
@@ -1336,12 +1514,12 @@ def test_bivariate_pdf() -> None:
 
 
 def run_tests() -> None:
-    logger.info("Running v7.5 scientific/unit tests...")
+    logger.info("Running v8.0 FINAL SINGLE-PASS scientific/unit tests...")
     test_calendar(); test_moments_against_numpy(); test_covariance_against_numpy()
     test_pebay_merge_equivalence(); test_physics(); test_bivariate_pdf()
     for xname, yname in BIVARIATE_PAIRS:
         assert xname in {"rh", "e", "r", "q"} and yname in {"rh", "e", "r", "q"} and xname != yname
-    logger.info("All v7.5 tests passed.")
+    logger.info("All v8.0 FINAL SINGLE-PASS tests passed.")
 
 # =============================================================================
 # 13. MAIN
@@ -1357,7 +1535,6 @@ def _global_progress(years: list[int]) -> tuple[int, int, float, int]:
             done_units += int(meta.get("completed_units", 0))
             total_units += int(meta.get("total_units", 0))
         elif final_path.exists() and is_year_complete(year):
-            # Completed years will be represented in metadata, but keep a safe fallback.
             with open_dataset(final_path) as ds:
                 ny = ds.sizes["latitude"]; nx = ds.sizes["longitude"]
             total_units += 365 * ((ny + CHUNK_LAT - 1) // CHUNK_LAT) * ((nx + CHUNK_LON - 1) // CHUNK_LON)
@@ -1366,10 +1543,9 @@ def _global_progress(years: list[int]) -> tuple[int, int, float, int]:
     pct = 100.0 * done_units / max(total_units, 1)
     return done_units, total_units, pct, remaining
 
-
 def main() -> None:
     logger.info("=" * 90)
-    logger.info("MOISTURE CLIMATOLOGY v7.5 - HOURLY EMPIRICAL PRODUCTION")
+    logger.info("MOISTURE CLIMATOLOGY v8.0 - PRODUCTION OPTIMIZED HOURLY EMPIRICAL ENGINE")
     logger.info("Period: %d-%d | Config hash: %s", START_YEAR, END_YEAR, CONFIG_HASH)
     logger.info("Bivariate empirical pairs: %s | bins=%dx%d | enabled=%s", BIVARIATE_PAIRS, BIVARIATE_NX, BIVARIATE_NY, BUILD_EMPIRICAL_BIVARIATE)
     logger.info("Spatial chunk: %dx%d cells | Workers: %d", CHUNK_LAT, CHUNK_LON, MAX_WORKERS)
@@ -1385,48 +1561,59 @@ def main() -> None:
             raise RuntimeError("Expected variable 't2m' not found.")
         lat = ds.latitude.values
         lon = ds.longitude.values
+
+    # --- فیلتر سال‌ها از طریق متغیر محیطی PROCESS_YEARS (قبلاً تنظیم شد) ---
+    import ast
+    process_years_env = os.environ.get("PROCESS_YEARS")
+    if process_years_env:
+        process_years = set(ast.literal_eval(process_years_env))
+    else:
+        process_years = None
+
     years = list(range(START_YEAR, END_YEAR + 1))
+    if process_years is not None:
+        years = [y for y in years if y in process_years]
+        if not years:
+            raise RuntimeError("PROCESS_YEARS is set but no valid years selected.")
+        logger.info("Processing only years: %s", sorted(years))
+
     ny, nx = len(lat), len(lon)
     per_year_units = 365 * ((ny + CHUNK_LAT - 1) // CHUNK_LAT) * ((nx + CHUNK_LON - 1) // CHUNK_LON)
     grand_total = per_year_units * len(years)
     logger.info("GLOBAL WORK PLAN | %d years | %d units/year | %d total units", len(years), per_year_units, grand_total)
 
     remaining_years = [y for y in years if not is_year_complete(y)]
+    initial_done = grand_total - len(remaining_years) * per_year_units
+    initial_remaining = grand_total - initial_done
+    logger.info("GLOBAL PROGRESS | %.2f%% | %d/%d units | remaining %d | active years %d",
+                100.0 * initial_done / max(grand_total, 1), initial_done, grand_total, initial_remaining, len(remaining_years))
+
+    # =====================================================================
+    # پردازش ترتیبی سال‌های ناقص
+    # =====================================================================
     if remaining_years:
-        logger.info("Annual checkpoints to process: %d/%d", len(remaining_years), len(years))
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(process_year_empirical, y): y for y in remaining_years}
-            pending = set(futures)
-            last_report = 0.0
-            while pending:
-                done = {f for f in pending if f.done()}
-                if done:
-                    for fut in done:
-                        y = futures[fut]
-                        result_y, path = fut.result()
-                        if path is None or not is_year_complete(result_y):
-                            raise RuntimeError(f"Year {result_y} processing failed; inspect retained checkpoint.")
-                        pending.remove(fut)
-                        du, tu, pct, rem = _global_progress(years)
-                        logger.info("GLOBAL PROGRESS | %.2f%% | %d/%d units | remaining %d | completed years %d/%d", pct, du, tu, rem, len(years)-len(pending), len(years))
-                now = time.time()
-                if pending and now - last_report >= PROGRESS_REFRESH_SECONDS:
-                    du, tu, pct, rem = _global_progress(years)
-                    logger.info("GLOBAL PROGRESS | %.2f%% | %d/%d units | remaining %d | active years %d", pct, du, tu, rem, len(pending))
-                    last_report = now
-                if pending:
-                    time.sleep(0.5)
+        logger.info("Annual checkpoints to process (sequential): %d/%d", len(remaining_years), len(years))
+        for year in remaining_years:
+            logger.info("Processing year %d sequentially...", year)
+            result_y, path = process_year_empirical(year)
+            if path is None or not is_year_complete(result_y):
+                raise RuntimeError(f"Year {result_y} processing failed; inspect retained checkpoint.")
+            du, tu, pct, rem = _global_progress(years)
+            logger.info("GLOBAL PROGRESS | %.2f%% | %d/%d units | remaining %d | completed years %d/%d",
+                        pct, du, tu, rem, len(years)-len([y for y in years if not is_year_complete(y)]), len(years))
     else:
-        logger.info("All annual checkpoints already valid; no accumulation work remains.")
+        logger.info("All selected annual checkpoints already valid; no accumulation work remains.")
 
     bad = [y for y in years if not is_year_complete(y)]
     if bad:
-        raise RuntimeError(f"Invalid/missing annual checkpoints: {bad}")
+        raise RuntimeError(f"Invalid/missing annual checkpoints for selected years: {bad}")
 
     du, tu, pct, rem = _global_progress(years)
     logger.info("ACCUMULATION COMPLETE | %.2f%% | %d/%d units | remaining %d", pct, du, tu, rem)
     logger.info("Finalizing outputs with DOY and spatial chunk streaming...")
+
     finalize_all(years, lat, lon)
+
     if BUILD_EMPIRICAL_BIVARIATE:
         for pair in BIVARIATE_PAIRS:
             if pair[0] in BIVARIATE_RANGES and pair[1] in BIVARIATE_RANGES:
@@ -1448,13 +1635,11 @@ def main() -> None:
                 atomic_json_write(RUN_MANIFEST_FILE, manifest_now)
             else:
                 logger.warning("Skipping empirical 2-D PDF for %s: no fixed physical range configured", pair)
-    logger.info("SUCCESS: v7.5 completed.")
+    logger.info("SUCCESS: v8.0 FINAL SINGLE-PASS completed for selected years.")
     logger.info("Main: %s", OUTPUT_FILE)
     logger.info("Diagnostics: %s", DIAGNOSTIC_FILE)
     logger.info("Bivariate: %s", BIVARIATE_FILE)
     logger.info("Run manifest: %s", RUN_MANIFEST_FILE)
-
-
 
 # =============================================================================
 # 13. FIVE-DAY CENTERED WINDOW + DISTRIBUTION/COPULA MODEL-SELECTION LAYER
@@ -1463,8 +1648,6 @@ def main() -> None:
 WINDOW_HALF_WIDTH_DAYS = 2
 WINDOW_SIZE_DAYS = 5
 EDGE_PADDING_FILES = {
-    # Optional combined T2m/D2m edge file supplied by the user for the first
-    # two days needed by the 1981-01-01 centred window.
     "1980-12-30_to_1980-12-31": Path(r"K:\kazemi\papers\temperature_interpolation\19801230-19801231.nc"),
 }
 
@@ -1477,7 +1660,6 @@ BIMODAL_REG_COVAR = 1e-6
 
 
 def canonical_time_name(ds: xr.Dataset) -> str:
-    """Return the actual time coordinate name; never infer it from filename."""
     for name in ("valid_time", "time"):
         if name in ds.coords or name in ds.dims:
             return name
@@ -1507,12 +1689,10 @@ def _special_edge_file() -> Optional[Path]:
 
 
 def _window_file_specs(start: datetime, end: datetime, folder: Path) -> list[tuple[Path, Optional[str]]]:
-    """Return unique monthly files intersecting [start,end], plus the special edge file."""
     specs: list[tuple[Path, Optional[str]]] = []
     cur = datetime(start.year, start.month, 1)
     last = datetime(end.year, end.month, 1)
     while cur <= last:
-        # For Dec-1980 the special combined edge file is authoritative for T/D.
         if cur.year == 1980 and cur.month == 12:
             edge = _special_edge_file()
             if edge is not None:
@@ -1527,7 +1707,6 @@ def _window_file_specs(start: datetime, end: datetime, folder: Path) -> list[tup
             cur = datetime(cur.year + 1, 1, 1)
         else:
             cur = datetime(cur.year, cur.month + 1, 1)
-    # De-duplicate paths while preserving order.
     seen=set(); out=[]
     for item in specs:
         if item[0] not in seen:
@@ -1537,7 +1716,6 @@ def _window_file_specs(start: datetime, end: datetime, folder: Path) -> list[tup
 
 def _read_variable_time_slice(path: Path, variable_candidates: tuple[str, ...], start: np.datetime64, end: np.datetime64,
                               lat_slice: slice, lon_slice: slice) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
-    """Read one variable from one file using actual time coordinate; supports valid_time and combined edge files."""
     with xr.open_dataset(path, engine="netcdf4", decode_times=True, mask_and_scale=True, cache=False) as ds:
         tname=canonical_time_name(ds)
         var=next((v for v in variable_candidates if v in ds.data_vars), None)
@@ -1554,11 +1732,6 @@ def _read_variable_time_slice(path: Path, variable_candidates: tuple[str, ...], 
 
 def extract_centered_five_day_window(target_date: str | datetime, variable: str, lat_index: int, lon_index: int,
                                     folder: Path, half_width_days: int = WINDOW_HALF_WIDTH_DAYS) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Extract one station/grid-cell hourly window using the project's 5-day centred rule.
-
-    The target date is the centre; returned timestamps are the actual timestamps from files.
-    The 1980-12-30/31 combined edge file is supported explicitly for the start of 1981.
-    """
     target = datetime.fromisoformat(str(target_date)[:10])
     start = np.datetime64(target - timedelta(days=half_width_days))
     end = np.datetime64(target + timedelta(days=half_width_days, hours=23))
@@ -1568,7 +1741,6 @@ def extract_centered_five_day_window(target_date: str | datetime, variable: str,
             tname=canonical_time_name(ds)
             var = variable if variable in ds.data_vars else {"t2m":"t2m", "d2m":"d2m", "sp":"sp"}.get(variable, variable)
             if var not in ds.data_vars:
-                # In the combined edge file, the requested variable may be absent (e.g. SP).
                 continue
             times=np.asarray(ds[tname].values)
             mask=(times>=start)&(times<=end)
@@ -1592,13 +1764,6 @@ def extract_centered_five_day_window(target_date: str | datetime, variable: str,
 
 
 def extract_centered_five_day_moisture_window(target_date: str | datetime, lat_index: int, lon_index: int) -> tuple[dict[str, np.ndarray], dict]:
-    """Extract T2m/D2m/SP for one grid cell over the 5-day centred window.
-
-    Variables are aligned by actual timestamp. T2m/D2m can use the supplied combined
-    1980-12-30/31 edge file. Surface pressure is read independently from SP_DIR; if
-    those two edge days are unavailable there, RH/e can still be fitted from T/D while
-    r/q/coplanarity carry their reduced pairwise coverage in diagnostics.
-    """
     def gather(varname: str, folder: Path) -> tuple[np.ndarray, np.ndarray, dict]:
         aliases={"t2m":("t2m",),"d2m":("d2m",),"sp":("sp",)}
         vals=[]; ts=[]; units=None; latv=None; lonv=None
@@ -1626,10 +1791,8 @@ def extract_centered_five_day_moisture_window(target_date: str | datetime, lat_i
     out={}; meta={"target_date":str(target_date)[:10],"window_days":WINDOW_SIZE_DAYS,"variables":{}}
     for var,folder in (("t2m",T2M_DIR),("d2m",D2M_DIR),("sp",SP_DIR)):
         a,t,m=gather(var,folder); out[var]=a; meta["variables"][var]={**m,"first_time":None if t.size==0 else str(t[0]),"last_time":None if t.size==0 else str(t[-1])}
-    # Exact timestamp intersection for paired states.
     if out["t2m"].size and out["d2m"].size:
         target=datetime.fromisoformat(str(target_date)[:10]); start=np.datetime64(target-timedelta(days=WINDOW_HALF_WIDTH_DAYS)); end=np.datetime64(target+timedelta(days=WINDOW_HALF_WIDTH_DAYS, hours=23))
-        # Re-read timestamps using the generic single-variable extractor at the target grid point.
         _,tt,mt=extract_centered_five_day_window(target_date,"t2m",lat_index,lon_index,T2M_DIR)
         _,td,md=extract_centered_five_day_window(target_date,"d2m",lat_index,lon_index,D2M_DIR)
         common=np.intersect1d(tt,td); meta["paired_T_D_count"]=int(common.size)
@@ -1659,18 +1822,15 @@ def _safe_logpdf_sum(dist, data, params) -> float:
 
 
 def _fit_standard_candidates(data: np.ndarray, bounded: bool = False) -> list[dict]:
-    """Fit Normal, Skew-Normal, Pearson III and Beta where scientifically valid."""
     from scipy import stats
     x=np.asarray(data,dtype=float); x=x[np.isfinite(x)]
     if x.size < FIT_MIN_OBS:
         return []
     out=[]
-    # Normal
     loc,scale=stats.norm.fit(x)
     if scale>0:
         ll=_safe_logpdf_sum(stats.norm,x,(loc,scale)); a,aicc,b=_aic_bic(ll,x.size,2)
         out.append({"name":"Normal","params":{"loc":float(loc),"scale":float(scale)},"loglik":ll,"aic":a,"aicc":aicc,"bic":b,"n_params":2})
-    # Skew-Normal: retain both the project's moment-based fit and a likelihood-refined fit.
     try:
         proj=fit_skewnormal_project_style(x)
         if proj.get("status")=="ok":
@@ -1684,7 +1844,6 @@ def _fit_standard_candidates(data: np.ndarray, bounded: bool = False) -> list[di
             out.append({"name":"SkewNormal_MLE","params":{"shape":float(alpha),"loc":float(loc),"scale":float(scale)},"loglik":ll,"aic":a,"aicc":aicc,"bic":b,"n_params":3})
     except Exception:
         pass
-    # Pearson III
     try:
         skew,loc,scale=stats.pearson3.fit(x)
         if scale>0:
@@ -1720,12 +1879,6 @@ def _fit_bimodal_normal(data: np.ndarray) -> Optional[dict]:
 
 
 def fit_skewnormal_project_style(data: np.ndarray) -> dict:
-    """Replicate the ClimateProcessingEngine plugin's moment-based parameterization.
-
-    The public plugin uses sample mean/std/skew to derive (xi, omega, alpha), then
-    evaluates the log-likelihood. We retain this as an auditable candidate alongside
-    scipy's MLE fit instead of silently replacing the project's fitting convention.
-    """
     from scipy import stats
     x=np.asarray(data,dtype=float); x=x[np.isfinite(x)]
     n=x.size
@@ -1778,7 +1931,6 @@ def fit_gaussian_copula(x: np.ndarray, y: np.ndarray) -> dict:
 
 
 def fit_window_models(window_values: dict[str,np.ndarray]) -> dict:
-    """Fit marginals and Gaussian copula to a single 5-day centred window."""
     result={"window":{k:int(np.isfinite(v).sum()) for k,v in window_values.items()}}
     result["marginals"]={}
     for var,vals in window_values.items():

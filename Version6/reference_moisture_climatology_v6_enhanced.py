@@ -82,7 +82,8 @@ CELL_CHUNK_SIZE = 1024
 SAMPLE_BATCH_SIZE = 256
 
 # Parallelism: 4 can be RAM-heavy on Windows; reduce to 2 if needed.
-MAX_WORKERS = 2  # conservative default for Windows/RAM; raise after benchmark
+MAX_WORKERS = 2  # hard ceiling; effective workers are capped by available RAM
+MEMORY_GB_PER_WORKER = 3.5  # conservative estimate for yearly accumulators + I/O
 
 RANDOM_SEED = 20260821
 
@@ -115,50 +116,66 @@ logger = logging.getLogger("Moisture_Climatology_v6")
 # =============================================================================
 # PROGRESS LOGGER
 # =============================================================================
-def runtime_snapshot() -> dict:
-    """Best-effort RAM/CPU snapshot for progress reporting."""
-    snap = {}
+def log_progress(event: str, **kwargs) -> None:
+    """
+    ثبت پیشرفت با اطلاعات مرحله، RAM و CPU.
+
+    استفاده:
+        log_progress("STAGE", phase="YEAR ACCUMULATION")
+        log_progress("YEAR-MONTH-START", year=1981, month=1)
+        log_progress("YEAR-DAY", year=1981, month=1,
+                     day=15, days_in_month=31, doy=15)
+        log_progress("YEAR-COMPLETE", year=1981,
+                     completed=1, total=40, remaining=39)
+    """
     try:
         import psutil
-        vm = psutil.virtual_memory()
-        snap["ram_used_gb"] = vm.used / (1024 ** 3)
-        snap["ram_available_gb"] = vm.available / (1024 ** 3)
-        snap["ram_percent"] = vm.percent
-        snap["cpu_percent"] = psutil.cpu_percent(interval=None)
-    except Exception:
-        pass
-    return snap
 
-def log_progress(event: str, **kwargs) -> None:
-    """Detailed non-fatal progress logging with RAM/CPU telemetry."""
-    try:
-        parts = [event]
+        vm = psutil.virtual_memory()
+        ram_used_gb = vm.used / (1024 ** 3)
+        ram_avail_gb = vm.available / (1024 ** 3)
+        ram_percent = vm.percent
+
+        cpu_percent = psutil.cpu_percent(interval=None)
+
+        parts = [
+            "PROGRESS",
+            event,
+        ]
+
+        # اطلاعات اختصاصی رویداد
         for key, value in kwargs.items():
             if value is None:
                 continue
+
             if isinstance(value, float):
-                if key in {"percent", "seconds", "elapsed", "eta"}:
+                if key == "percent":
+                    value = f"{value:.2f}"
+                elif key in {"seconds", "elapsed", "eta"}:
                     value = f"{value:.2f}"
                 else:
                     value = f"{value:.4f}"
+
             parts.append(f"{key}={value}")
 
-        snap = runtime_snapshot()
-        if "ram_used_gb" in snap:
-            parts.append(f"RAM={snap['ram_used_gb']:.2f}GB")
-            parts.append(f"avail={snap['ram_available_gb']:.2f}GB")
-            parts.append(f"used={snap['ram_percent']:.0f}%")
-        if "cpu_percent" in snap:
-            parts.append(f"CPU={snap['cpu_percent']:.0f}%")
+        # وضعیت سیستم
+        parts.append(f"RAM={ram_used_gb:.2f}GB")
+        parts.append(f"avail={ram_avail_gb:.2f}GB")
+        parts.append(f"used={ram_percent:.0f}%")
+        parts.append(f"CPU={cpu_percent:.0f}%")
 
-        logger.info("PROGRESS | " + " | ".join(parts))
+        logger.info(" | ".join(parts))
+
     except Exception:
-        # Progress telemetry must never interrupt production calculations.
+        # Progress logging نباید هیچ‌وقت باعث توقف محاسبات شود.
         try:
-            logger.info("PROGRESS | %s", event)
+            logger.info(
+                "PROGRESS | %s | %s",
+                event,
+                " | ".join(f"{k}={v}" for k, v in kwargs.items())
+            )
         except Exception:
             pass
-
 
 # =============================================================================
 # 3. CONFIG HASH / SCRIPT HASH
@@ -197,6 +214,58 @@ def hash_dict(d: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
 
 CONFIG_HASH = hash_dict(asdict(CONFIG))
+
+def effective_workers() -> int:
+    """Cap workers using available system RAM when detectable."""
+    try:
+        import psutil
+        avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+        by_ram = max(1, int(avail_gb // MEMORY_GB_PER_WORKER))
+        return max(1, min(MAX_WORKERS, by_ram))
+    except Exception:
+        return MAX_WORKERS
+
+
+def runtime_snapshot() -> dict:
+    """Best-effort RAM/CPU snapshot for detailed progress reporting."""
+    snap = {}
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        snap["ram_used_gb"] = vm.used / (1024 ** 3)
+        snap["ram_available_gb"] = vm.available / (1024 ** 3)
+        snap["ram_percent"] = vm.percent
+        snap["cpu_percent"] = psutil.cpu_percent(interval=None)
+    except Exception:
+        pass
+    return snap
+
+def software_metadata() -> dict:
+    meta = {
+        "python_version": sys.version.split()[0],
+        "numpy_version": np.__version__,
+        "xarray_version": xr.__version__,
+        "script_sha256": script_sha256(),
+    }
+    try:
+        import scipy
+        meta["scipy_version"] = scipy.__version__
+    except Exception:
+        meta["scipy_version"] = "unavailable"
+    try:
+        import netCDF4
+        meta["netcdf4_version"] = netCDF4.__version__
+    except Exception:
+        meta["netcdf4_version"] = "unavailable"
+    try:
+        import psutil
+        meta["available_ram_gb_at_start"] = round(
+            psutil.virtual_memory().available / (1024 ** 3), 3
+        )
+    except Exception:
+        meta["available_ram_gb_at_start"] = None
+    return meta
+
 
 def script_sha256() -> str:
     try:
@@ -558,6 +627,8 @@ def process_year_welford(year: int) -> tuple[int, Optional[Path]]:
         C_Td_logP = np.zeros_like(mean_T)
 
         for month in range(1, 13):
+            month_t0 = time.time()
+            log_progress("YEAR-MONTH-START", year=year, month=month)
             with (
                 open_dataset(t_idx[month]) as ds_t,
                 open_dataset(d_idx[month]) as ds_d,
@@ -578,6 +649,14 @@ def process_year_welford(year: int) -> tuple[int, Optional[Path]]:
                 native_doys = ds_t.time.dt.dayofyear.values.astype(np.int16)
 
                 for ti, ndoy in enumerate(native_doys):
+                    if ti == 0 or ti == len(native_doys) - 1 or (ti + 1) % 5 == 0:
+                        log_progress(
+                            "YEAR-DAY",
+                            year=year,
+                            month=month,
+                            day=f"{ti+1}/{len(native_doys)}",
+                            doy=int(ndoy),
+                        )
                     cdoy = get_clim_doy(int(ndoy), year)
                     if cdoy < 1 or cdoy > DOY_COUNT:
                         continue
@@ -627,6 +706,13 @@ def process_year_welford(year: int) -> tuple[int, Optional[Path]]:
                     mean_Td[di, idx] = new_Td
                     mean_logP[di, idx] = new_lp
                     n[di, idx] = n_new.astype(np.int64)
+
+            log_progress(
+                "YEAR-MONTH-END",
+                year=year,
+                month=month,
+                seconds=time.time() - month_t0,
+            )
 
         npz_path, json_path = year_paths(year)
         atomic_npz_write(
@@ -866,7 +952,16 @@ def merge_years_v2(years: Iterable[int], shape: tuple[int, int]) -> dict:
         "C_Td_logP": C_Td_logP,
     }
 
-def stats_from_merged(w: dict) -> dict:
+def stats_from_merged(w: dict, grid_shape: tuple[int, int]) -> dict:
+    """Convert merged flat-cell statistics back to (doy, lat, lon)."""
+    ny, nx = grid_shape
+    expected = ny * nx
+    if w["n"].ndim != 2 or w["n"].shape != (DOY_COUNT, expected):
+        raise ValueError(
+            f"Merged accumulator shape mismatch: {w['n'].shape}; "
+            f"expected ({DOY_COUNT}, {expected}) for grid {grid_shape}."
+        )
+
     n = w["n"]
     valid = n >= 2
 
@@ -929,6 +1024,12 @@ def stats_from_merged(w: dict) -> dict:
     tmp = np.full_like(cov_Td_lp, np.nan)
     tmp[mask] = cov_Td_lp[mask] / den[mask]
     out["corr_Td_logP"][valid] = np.clip(tmp, -0.999999, 0.999999).astype(np.float32)
+
+    # Public statistics contract: (doy, latitude, longitude).
+    # The merge stage uses (doy, cell) for compact vectorized accumulation,
+    # so reshape exactly once at this boundary.
+    for key, arr in list(out.items()):
+        out[key] = arr.reshape(DOY_COUNT, ny, nx)
 
     return out
 
@@ -1146,6 +1247,10 @@ def empty_day_output(ny: int, nx: int) -> dict:
         "invalid_e_over_p_fraction": b.copy(),
         "invalid_covariance_fraction": b.copy(),
         "min_eigenvalue": b.copy(),
+        "mc_se_mean_rh": b.copy(),
+        "mc_se_mean_e": b.copy(),
+        "mc_se_mean_r": b.copy(),
+        "mc_se_mean_q": b.copy(),
         "valid_sample_count": np.zeros((ny, nx), dtype=np.int32),
     }
 
@@ -1154,6 +1259,7 @@ def process_day(doy0: int, stats: dict) -> Optional[dict]:
     npz_path, json_path = day_paths(doy)
 
     if valid_day_checkpoint(doy):
+        log_progress("DAY-SKIP-CHECKPOINT", doy=doy)
         with np.load(npz_path, allow_pickle=False) as d:
             return {k: d[k] for k in d.files}
 
@@ -1189,74 +1295,109 @@ def process_day(doy0: int, stats: dict) -> Optional[dict]:
                 "status": "completed",
                 "doy": doy,
                 "config_hash": CONFIG_HASH,
+                "schema_version": CHECKPOINT_VERSION,
                 "sha256": sha256_file(npz_path),
                 "n_valid_cells": 0,
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             },
         )
         return out
 
+    day_t0 = time.time()
     rng = np.random.default_rng(CONFIG.random_seed + doy)
     chunk_size = CONFIG.cell_chunk_size
     batch_size = CONFIG.sample_batch_size
+    n_chunks_total = int(np.ceil(flat_valid.size / chunk_size))
 
-    # Diagnostics accumulators
-    total_cov_bad = np.zeros(flat_valid.size, dtype=np.int64)
+    total_cov_bad = np.zeros(flat_valid.size, dtype=np.int8)
     total_e_over_p = np.zeros(flat_valid.size, dtype=np.int64)
     total_samples = np.zeros(flat_valid.size, dtype=np.int64)
     total_supersat = np.zeros(flat_valid.size, dtype=np.int64)
     min_eig_global = np.full(flat_valid.size, np.inf, dtype=np.float64)
 
-    keys = ["rh", "e", "r", "q"]
+    keys = ("rh", "e", "r", "q")
 
-    for start in range(0, flat_valid.size, chunk_size):
-        ids = np.arange(start, min(start + chunk_size, flat_valid.size))
+    log_progress(
+        "DAY-START",
+        doy=doy,
+        total=DOY_COUNT,
+        valid_cells=int(flat_valid.size),
+        chunks=n_chunks_total,
+        n_samples=CONFIG.n_samples,
+    )
+
+    for chunk_no, start_idx in enumerate(
+        range(0, flat_valid.size, chunk_size), start=1
+    ):
+        chunk_t0 = time.time()
+        ids = np.arange(
+            start_idx,
+            min(start_idx + chunk_size, flat_valid.size),
+            dtype=np.int64,
+        )
         cell = flat_valid[ids]
 
-        mu = np.column_stack([
-            mt[cell], mtd[cell], mlp[cell]
-        ]).astype(np.float64)
+        log_progress(
+            "MC-CHUNK-START",
+            doy=doy,
+            chunk=f"{chunk_no}/{n_chunks_total}",
+            cells=int(len(ids)),
+        )
 
-        sig = np.column_stack([
-            st[cell], std[cell], slp[cell]
-        ]).astype(np.float64)
+        mu = np.column_stack(
+            [mt[cell], mtd[cell], mlp[cell]]
+        ).astype(np.float64)
+
+        sig = np.column_stack(
+            [st[cell], std[cell], slp[cell]]
+        ).astype(np.float64)
 
         R = build_corr_batch(r1[cell], r2[cell], r3[cell])
         L, chol_valid, mineig, repaired = cholesky_batch(R)
 
         min_eig_global[ids] = mineig
-        total_cov_bad[ids] = (~chol_valid).astype(np.int64)
+        total_cov_bad[ids] = (~chol_valid).astype(np.int8)
 
         good = chol_valid
         if not np.any(good):
+            log_progress(
+                "MC-CHUNK-END",
+                doy=doy,
+                chunk=f"{chunk_no}/{n_chunks_total}",
+                valid_cells=0,
+                seconds=time.time() - chunk_t0,
+            )
             continue
 
         ids_good = ids[good]
-        cell_good = cell[good]
         mu_good = mu[good]
         sig_good = sig[good]
         L_good = L[good]
-
         ncell = len(ids_good)
 
         moments = {}
         for key in keys:
             moments[key] = {
-                "n": np.zeros(ncell, np.int64),
-                "mean": np.zeros(ncell, np.float64),
-                "M2": np.zeros(ncell, np.float64),
-                "M3": np.zeros(ncell, np.float64),
-                "M4": np.zeros(ncell, np.float64),
+                "n": np.zeros(ncell, dtype=np.int64),
+                "mean": np.zeros(ncell, dtype=np.float64),
+                "M2": np.zeros(ncell, dtype=np.float64),
+                "M3": np.zeros(ncell, dtype=np.float64),
+                "M4": np.zeros(ncell, dtype=np.float64),
             }
 
         supersat = np.zeros(ncell, dtype=np.int64)
         invalid_ep = np.zeros(ncell, dtype=np.int64)
-        sampled = np.zeros(ncell, dtype=np.int64)
 
         consumed = 0
-        while consumed < CONFIG.n_samples:
-            bn = min(batch_size, CONFIG.n_samples - consumed)
-            Z = rng.standard_normal((bn, ncell, 3)).astype(np.float32)
+        batch_no = 0
+        total_batches = int(np.ceil(CONFIG.n_samples / batch_size))
 
+        while consumed < CONFIG.n_samples:
+            batch_no += 1
+            batch_t0 = time.time()
+            bn = min(batch_size, CONFIG.n_samples - consumed)
+
+            Z = rng.standard_normal((bn, ncell, 3)).astype(np.float32)
             Xstd = np.einsum(
                 "bci,cij->bcj",
                 Z,
@@ -1264,44 +1405,80 @@ def process_day(doy0: int, stats: dict) -> Optional[dict]:
                 optimize=True,
             )
 
-            T = mu_good[:, 0][None, :] + sig_good[:, 0][None, :] * Xstd[:, :, 0]
-            Td = mu_good[:, 1][None, :] + sig_good[:, 1][None, :] * Xstd[:, :, 1]
-            logP = mu_good[:, 2][None, :] + sig_good[:, 2][None, :] * Xstd[:, :, 2]
+            T = (
+                mu_good[:, 0][None, :]
+                + sig_good[:, 0][None, :] * Xstd[:, :, 0]
+            )
+            Td = (
+                mu_good[:, 1][None, :]
+                + sig_good[:, 1][None, :] * Xstd[:, :, 1]
+            )
+            logP = (
+                mu_good[:, 2][None, :]
+                + sig_good[:, 2][None, :] * Xstd[:, :, 2]
+            )
             P = np.exp(logP.astype(np.float64)).astype(np.float32)
 
-            phys = derive_moisture(T.astype(np.float32), Td.astype(np.float32), P)
+            phys = derive_moisture(
+                T.astype(np.float32),
+                Td.astype(np.float32),
+                P,
+            )
 
             valid_all = phys["valid_all"]
-            n2, mean2, M22, M32, M42 = batch_moments(phys["rh"], valid_all)
-            n1 = moments["rh"]["n"]
-            n, m, M2, M3, M4 = combine_moments(
-                n1, moments["rh"]["mean"], moments["rh"]["M2"], moments["rh"]["M3"], moments["rh"]["M4"],
-                n2, mean2, M22, M32, M42
+
+            n2, mean2, M22, M32, M42 = batch_moments(
+                phys["rh"], valid_all
             )
-            moments["rh"] = {"n": n, "mean": m, "M2": M2, "M3": M3, "M4": M4}
+            a = moments["rh"]
+            n_new, m_new, M2_new, M3_new, M4_new = combine_moments(
+                a["n"], a["mean"], a["M2"], a["M3"], a["M4"],
+                n2, mean2, M22, M32, M42,
+            )
+            moments["rh"] = {
+                "n": n_new, "mean": m_new,
+                "M2": M2_new, "M3": M3_new, "M4": M4_new,
+            }
 
             for key in ("e", "r", "q"):
-                n2, mean2, M22, M32, M42 = batch_moments(phys[key], valid_all)
+                n2, mean2, M22, M32, M42 = batch_moments(
+                    phys[key], valid_all
+                )
                 a = moments[key]
-                moments[key] = dict(zip(
-                    ("n", "mean", "M2", "M3", "M4"),
-                    combine_moments(
-                        a["n"], a["mean"], a["M2"], a["M3"], a["M4"],
-                        n2, mean2, M22, M32, M42,
-                    )
-                ))
+                n_new, m_new, M2_new, M3_new, M4_new = combine_moments(
+                    a["n"], a["mean"], a["M2"], a["M3"], a["M4"],
+                    n2, mean2, M22, M32, M42,
+                )
+                moments[key] = {
+                    "n": n_new, "mean": m_new,
+                    "M2": M2_new, "M3": M3_new, "M4": M4_new,
+                }
 
             supersat += phys["supersat"].sum(axis=0).astype(np.int64)
             invalid_ep += phys["invalid_e_over_p"].sum(axis=0).astype(np.int64)
-            sampled += valid_all.sum(axis=0).astype(np.int64)
 
             consumed += bn
 
+            if (
+                batch_no == 1
+                or batch_no == total_batches
+                or batch_no % 4 == 0
+            ):
+                log_progress(
+                    "MC-BATCH",
+                    doy=doy,
+                    chunk=f"{chunk_no}/{n_chunks_total}",
+                    batch=f"{batch_no}/{total_batches}",
+                    samples=f"{consumed}/{CONFIG.n_samples}",
+                    seconds=time.time() - batch_t0,
+                )
+
+        # Materialize chunk results.
         for local, orig_id in enumerate(ids_good):
             rr = rows[orig_id]
             cc = cols[orig_id]
+            nvalid = int(moments["rh"]["n"][local])
 
-            nvalid = moments["rh"]["n"][local]
             total_samples[orig_id] = nvalid
             total_supersat[orig_id] = supersat[local]
             total_e_over_p[orig_id] = invalid_ep[local]
@@ -1309,8 +1486,16 @@ def process_day(doy0: int, stats: dict) -> Optional[dict]:
             if nvalid < MIN_MC_VALID:
                 continue
 
-            for key, prefix in [("rh", "rh"), ("e", "e"), ("r", "r"), ("q", "q")]:
+            se_values = {}
+
+            for key, prefix in (
+                ("rh", "rh"),
+                ("e", "e"),
+                ("r", "r"),
+                ("q", "q"),
+            ):
                 a = moments[key]
+
                 n1 = np.array([a["n"][local]], dtype=np.int64)
                 M2 = np.array([a["M2"][local]], dtype=np.float64)
                 M3 = np.array([a["M3"][local]], dtype=np.float64)
@@ -1318,13 +1503,22 @@ def process_day(doy0: int, stats: dict) -> Optional[dict]:
                 mean = float(a["mean"][local])
 
                 var = M2[0] / (nvalid - 1)
-                stdv = np.sqrt(max(var, 0.0))
-                sk, ku = sample_adjusted_skew_kurt(n1, M2, M3, M4)
+                stdv = float(np.sqrt(max(var, 0.0)))
+                sk, ku = sample_adjusted_skew_kurt(
+                    n1, M2, M3, M4
+                )
 
                 out[f"mean_{prefix}"][rr, cc] = np.float32(mean)
                 out[f"std_{prefix}"][rr, cc] = np.float32(stdv)
                 out[f"skew_{prefix}"][rr, cc] = np.float32(sk[0])
                 out[f"kurt_{prefix}"][rr, cc] = np.float32(ku[0])
+
+                se_values[prefix] = stdv / np.sqrt(float(nvalid))
+
+            out["mc_se_mean_rh"][rr, cc] = np.float32(se_values["rh"])
+            out["mc_se_mean_e"][rr, cc] = np.float32(se_values["e"])
+            out["mc_se_mean_r"][rr, cc] = np.float32(se_values["r"])
+            out["mc_se_mean_q"][rr, cc] = np.float32(se_values["q"])
 
             out["supersat_fraction"][rr, cc] = np.float32(
                 total_supersat[orig_id] / max(nvalid, 1)
@@ -1335,8 +1529,33 @@ def process_day(doy0: int, stats: dict) -> Optional[dict]:
             out["invalid_covariance_fraction"][rr, cc] = np.float32(
                 total_cov_bad[orig_id] > 0
             )
-            out["min_eigenvalue"][rr, cc] = np.float32(min_eig_global[orig_id])
+            out["min_eigenvalue"][rr, cc] = np.float32(
+                min_eig_global[orig_id]
+            )
             out["valid_sample_count"][rr, cc] = np.int32(nvalid)
+
+        log_progress(
+            "MC-CHUNK-END",
+            doy=doy,
+            chunk=f"{chunk_no}/{n_chunks_total}",
+            valid_cells=int(ncell),
+            seconds=time.time() - chunk_t0,
+        )
+
+    log_progress(
+        "MC-DAY-END",
+        doy=doy,
+        seconds=time.time() - day_t0,
+        valid_cells=int(flat_valid.size),
+        min_valid_samples=(
+            int(np.min(total_samples[total_samples > 0]))
+            if np.any(total_samples > 0) else 0
+        ),
+        max_valid_samples=(
+            int(np.max(total_samples))
+            if total_samples.size else 0
+        ),
+    )
 
     atomic_npz_write(npz_path, **out)
     atomic_json_write(
@@ -1351,7 +1570,10 @@ def process_day(doy0: int, stats: dict) -> Optional[dict]:
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         },
     )
+
+    log_progress("DAY-CHECKPOINT", doy=doy, seconds=time.time() - day_t0)
     return out
+
 
 # =============================================================================
 # 13. NETCDF STREAMING FINALIZER
@@ -1430,6 +1652,8 @@ def create_main_netcdf(path: Path, lat: np.ndarray, lon: np.ndarray):
     }
     for k,v in attrs.items():
         setattr(ds, k, v)
+    for k, v in software_metadata().items():
+        setattr(ds, k, str(v))
 
     return ds
 
@@ -1451,6 +1675,10 @@ def create_diag_netcdf(path: Path, lat: np.ndarray, lon: np.ndarray):
         "invalid_e_over_p_fraction",
         "invalid_covariance_fraction",
         "min_eigenvalue",
+        "mc_se_mean_rh",
+        "mc_se_mean_e",
+        "mc_se_mean_r",
+        "mc_se_mean_q",
     ]
     for name in float_vars:
         ds.createVariable(
@@ -1481,6 +1709,10 @@ def create_diag_netcdf(path: Path, lat: np.ndarray, lon: np.ndarray):
     ds.config_hash = CONFIG_HASH
     ds.schema_version = SCHEMA_VERSION
     ds.script_sha256 = script_sha256()
+    for k, v in software_metadata().items():
+        setattr(ds, k, str(v))
+    ds.mc_se_description = "Monte Carlo standard error of the estimated mean"
+    ds.invalid_covariance_description = "1 when the cell covariance/Cholesky was invalid; 0 otherwise"
     return ds
 
 def write_day_to_netcdf(ds_main, ds_diag, doy0: int, out: dict, stats: dict):
@@ -1504,6 +1736,10 @@ def write_day_to_netcdf(ds_main, ds_diag, doy0: int, out: dict, stats: dict):
         "invalid_e_over_p_fraction",
         "invalid_covariance_fraction",
         "min_eigenvalue",
+        "mc_se_mean_rh",
+        "mc_se_mean_e",
+        "mc_se_mean_r",
+        "mc_se_mean_q",
     ]:
         arr = np.asarray(out[key], dtype=np.float32)
         arr = np.where(np.isfinite(arr), arr, -9999.0)
@@ -1555,6 +1791,66 @@ def finalize_streaming(lat, lon, stats):
 
     os.replace(tmp_main, OUTPUT_FILE)
     os.replace(tmp_diag, DIAGNOSTIC_FILE)
+
+# =============================================================================
+# 13.5. INDEPENDENT GROUND TRUTH FOR PHYSICAL TRANSFORMATION
+# =============================================================================
+
+def ground_truth_simple(
+    T: np.ndarray,
+    Td: np.ndarray,
+    P_hpa: np.ndarray,
+) -> dict:
+    """
+    Deliberately simple scalar-loop reference implementation.
+    Used only for small synthetic tests; never used in production processing.
+    """
+    if T.shape != Td.shape or T.shape != P_hpa.shape:
+        raise ValueError("Ground-truth arrays must have identical shapes.")
+
+    out = {
+        "rh": np.full(T.shape, np.nan, dtype=np.float64),
+        "e": np.full(T.shape, np.nan, dtype=np.float64),
+        "r": np.full(T.shape, np.nan, dtype=np.float64),
+        "q": np.full(T.shape, np.nan, dtype=np.float64),
+    }
+
+    it = np.nditer(
+        [T, Td, P_hpa, out["rh"], out["e"], out["r"], out["q"]],
+        flags=["refs_ok", "multi_index", "zerosize_ok"],
+        op_flags=[
+            ["readonly"], ["readonly"], ["readonly"],
+            ["writeonly"], ["writeonly"], ["writeonly"], ["writeonly"],
+        ],
+    )
+
+    for tv, tdv, pv, rhv, ev, rv, qv in it:
+        t = float(tv)
+        td = float(tdv)
+        p = float(pv)
+
+        if not (np.isfinite(t) and np.isfinite(td) and np.isfinite(p) and p > 0):
+            continue
+
+        es_t = float(saturation_vapor_pressure(np.array([t], dtype=np.float32))[0])
+        e = float(saturation_vapor_pressure(np.array([td], dtype=np.float32))[0])
+
+        if not (np.isfinite(es_t) and np.isfinite(e) and es_t > 0):
+            continue
+
+        rh_raw = 100.0 * e / es_t
+        rh = float(np.clip(rh_raw, 0.0, 100.0))
+
+        rhv[...] = rh
+        ev[...] = e
+
+        if e > 0.0 and e < p:
+            r = 0.622 * e / (p - e)
+            q = r / (1.0 + r)
+            rv[...] = r
+            qv[...] = q
+
+    return out
 
 # =============================================================================
 # 14. TESTS
@@ -1632,14 +1928,16 @@ def test_ground_truth_vectorized_physics():
     fast = derive_moisture(T, Td, P)
 
     for key in ("rh", "e", "r", "q"):
-        got = fast[key]
-        ref = slow[key]
+        got = np.asarray(fast[key], dtype=np.float64)
+        ref = np.asarray(slow[key], dtype=np.float64)
+        both_nan = np.isnan(got) & np.isnan(ref)
+        assert np.all(both_nan | np.isfinite(got) | np.isfinite(ref))
         mask = np.isfinite(ref) & np.isfinite(got)
-        assert np.any(mask)
+        assert np.any(mask), f"{key}: no common finite values"
         err = np.max(np.abs(got[mask] - ref[mask]))
         assert err < 1e-5, f"{key}: max error {err}"
 
-    logger.info("PASS: vectorized physics vs Ground Truth")
+    logger.info("PASS: vectorized physics vs independent Ground Truth")
 
 
 def test_mvn_physics():
@@ -1692,11 +1990,27 @@ def main():
 
     run_tests()
 
-    sample_file = build_file_index(START_YEAR, T2M_DIR)[1]
+    sample_index = build_file_index(START_YEAR, T2M_DIR)
+    sample_file = sample_index[1]
     with open_dataset(sample_file) as ds:
+        if "average_t2m" not in ds.data_vars:
+            raise RuntimeError("Expected variable 'average_t2m' not found in T2m input.")
         ds = sort_dataset(ds)
         lat = ds.latitude.values
         lon = ds.longitude.values
+        if ds.sizes["latitude"] < 2 or ds.sizes["longitude"] < 2:
+            raise RuntimeError("Input grid is unexpectedly small.")
+
+    # Preflight all three datasets for the starting year.
+    for folder, var_name in [
+        (T2M_DIR, "average_t2m"),
+        (D2M_DIR, "average_d2m"),
+        (SP_DIR, "average_sp"),
+    ]:
+        idx0 = build_file_index(START_YEAR, folder)
+        with open_dataset(idx0[1]) as d0:
+            if var_name not in d0.data_vars:
+                raise RuntimeError(f"Expected variable '{var_name}' not found in {folder}.")
 
     shape = (len(lat), len(lon))
     years = list(range(START_YEAR, END_YEAR+1))
@@ -1705,9 +2019,10 @@ def main():
     # ---- Year checkpoints
     remaining = [y for y in years if not is_year_complete(y)]
     if remaining:
-        logger.info(f"Years remaining: {len(remaining)}")
+        workers = effective_workers()
+        logger.info(f"Years remaining: {len(remaining)} | effective workers: {workers}")
         processed = []
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(process_year_welford, y): y for y in remaining}
             for fut in tqdm(as_completed(futs), total=len(futs), desc="Years"):
                 y = futs[fut]
@@ -1715,6 +2030,13 @@ def main():
                 if path is None or not is_year_complete(result_y):
                     raise RuntimeError(f"Year {result_y} did not produce a valid checkpoint.")
                 processed.append(result_y)
+                log_progress(
+                    "YEAR-COMPLETE",
+                    year=result_y,
+                    completed=len(processed),
+                    total=len(years),
+                    remaining=len(remaining) - len(processed),
+                )
 
     # Validate every year before merge.
     bad = [y for y in years if not is_year_complete(y)]
@@ -1725,15 +2047,29 @@ def main():
     # ---- Merge
     logger.info("Merging yearly accumulators...")
     merged = merge_years_v2(years, shape)
-    stats = stats_from_merged(merged)
+    stats = stats_from_merged(merged, shape)
 
     log_progress("STAGE", phase="DAILY MONTE CARLO")
     # ---- Daily MC
     logger.info("Running daily Monte Carlo...")
-    for doy0 in tqdm(range(DOY_COUNT), desc="Days"):
-        if valid_day_checkpoint(doy0+1):
+    for doy0 in tqdm(range(DOY_COUNT), desc="Days", unit="day"):
+        doy = doy0 + 1
+        if valid_day_checkpoint(doy):
+            log_progress("DAY-SKIP-CHECKPOINT", doy=doy, total=DOY_COUNT)
             continue
+        log_progress(
+            "DAY-START",
+            doy=doy,
+            total=DOY_COUNT,
+            percent=100.0 * doy / DOY_COUNT,
+        )
         process_day(doy0, stats)
+        log_progress(
+            "DAY-COMPLETE",
+            doy=doy,
+            total=DOY_COUNT,
+            percent=100.0 * doy / DOY_COUNT,
+        )
 
     bad_days = [d for d in range(1, DOY_COUNT+1) if not valid_day_checkpoint(d)]
     if bad_days:
@@ -1746,6 +2082,16 @@ def main():
 
     # ---- Final independent sanity validation
     with xr.open_dataset(OUTPUT_FILE) as ds:
+        required_dims = {"doy": 366, "latitude": len(lat), "longitude": len(lon)}
+        for dim, expected in required_dims.items():
+            if ds.sizes.get(dim) != expected:
+                raise RuntimeError(f"Dimension validation failed for {dim}: {ds.sizes.get(dim)} != {expected}")
+
+        if not np.all(np.diff(ds["latitude"].values) < 0) and not np.all(np.diff(ds["latitude"].values) > 0):
+            raise RuntimeError("Latitude coordinate is not strictly monotonic.")
+        if not np.all(np.diff(ds["longitude"].values) > 0):
+            raise RuntimeError("Longitude coordinate is not strictly increasing.")
+
         mean_rh = ds["mean_rh"].where(ds["mean_rh"] != -9999)
         mean_q = ds["mean_specific_humidity"].where(ds["mean_specific_humidity"] != -9999)
         mean_r = ds["mean_mixing_ratio"].where(ds["mean_mixing_ratio"] != -9999)
@@ -1753,12 +2099,19 @@ def main():
 
         if float(mean_rh.min()) < -1e-6 or float(mean_rh.max()) > 100.000001:
             raise RuntimeError("Final RH range validation failed.")
-        if float(mean_q.min()) < -1e-12:
-            raise RuntimeError("Final q validation failed.")
+        if float(mean_q.min()) < -1e-12 or float(mean_q.max()) >= 1.0:
+            raise RuntimeError("Final q range validation failed.")
         if float(mean_r.min()) < -1e-12:
             raise RuntimeError("Final r validation failed.")
         if float(mean_e.min()) <= 0:
             raise RuntimeError("Final vapor pressure validation failed.")
+
+    with xr.open_dataset(DIAGNOSTIC_FILE) as dd:
+        for name in ("supersaturation_fraction", "invalid_e_over_p_fraction", "invalid_covariance_fraction"):
+            if float(dd[name].min()) < -1e-6 or float(dd[name].max()) > 1.000001:
+                raise RuntimeError(f"Diagnostic range validation failed: {name}")
+        if float(dd["valid_sample_count"].max()) > CONFIG.n_samples:
+            raise RuntimeError("valid_sample_count exceeds N_SAMPLES.")
 
     logger.info("="*80)
     logger.info("SUCCESS: moisture climatology completed.")

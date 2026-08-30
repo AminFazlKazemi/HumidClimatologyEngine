@@ -1,0 +1,5 @@
+2026-08-29 19:50:32,557 - INFO - ✅ Found gh at: C:\C\gh.exe
+2026-08-29 19:50:33,393 - INFO - ✅ Already logged in.
+2026-08-29 19:50:34,978 - INFO - ℹ️  Repository already exists on GitHub.
+2026-08-29 19:50:35,118 - INFO - 🌐 Remote already set: https://github.com/AminFazlKazemi/HumidClimatologyEngine.git
+2026-08-29 19:50:35,148 - INFO - 🔍 DRY RUN: would add, commit, and force push.

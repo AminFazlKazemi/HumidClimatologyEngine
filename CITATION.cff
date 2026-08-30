@@ -4,7 +4,7 @@ type: software
 authors:
   - family-names: Fazlkazemi
     given-names: Amin
-version: 0.6.0
-date-released: 2026-08-22
+version: 11.5.0
+date-released: 2026-08-29
 license: MIT
 repository-code: https://github.com/YOUR-USERNAME/HumidClimatologyEngine

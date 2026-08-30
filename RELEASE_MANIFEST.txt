@@ -1,8 +1,12 @@
 HumidClimatologyEngine v11.5 Public Release Bundle
 
-Purpose: release manifest for the public v11.5 source, documentation, metadata, and operational support files.
+Release:
+- Project: HumidClimatologyEngine
+- Public release: v11.5
+- Software version: 11.5.0
+- Status: PUBLIC RELEASE
 
-Root release metadata:
+Root:
 - humid_climatology_engine_v11.5.py
 - README.md
 - CHANGELOG.md
@@ -27,4 +31,10 @@ Documentation:
 - docs/HumidClimatologyEngine_v11.5_Who_Should_Use_It_and_Applications.docx
 - docs/HumidClimatologyEngine_v11.5_Analytical_Graphical_Comparison_Toolkit_Specification.docx
 
-Historical material may be archived separately and should not be confused with the current v11.5 release.
+Validation evidence reflected by the release documentation:
+- D2m latitude alignment to the T2m reference grid: PASS
+- January 2011 real-data pilot: 31/31 days PASS
+- Checkpoint flush: PASS
+- Checkpoint reopen: PASS
+
+Checksum fields should be populated only from the exact final release artifacts; no placeholder hashes are asserted here.

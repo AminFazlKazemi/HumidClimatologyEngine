@@ -1,38 +1,44 @@
 from pathlib import Path
 import importlib.util
-import numpy as np
+
 import pytest
 
-CORE = Path(__file__).resolve().parents[1] / "src" / "moisture_climatology_v6.py"
+CORE = Path(__file__).resolve().parents[1] / "humid_climatology_engine_v11.5.py"
 
-try:
-    spec = importlib.util.spec_from_file_location("humid_engine", CORE)
+
+def load_core():
+    if not CORE.exists():
+        pytest.skip(f"v11.5 core not present at {CORE}")
+    spec = importlib.util.spec_from_file_location("humid_engine_v11_5", CORE)
+    if spec is None or spec.loader is None:
+        pytest.fail("Unable to load v11.5 core module")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-except ImportError as exc:
-    pytest.skip(f"runtime dependency unavailable: {exc}", allow_module_level=True)
+    try:
+        spec.loader.exec_module(mod)
+    except ImportError as exc:
+        pytest.skip(f"runtime dependency unavailable: {exc}")
+    return mod
 
 
-def test_leap_day_mapping():
-    assert mod.get_clim_doy(59, 1984) == 60
-    assert mod.get_clim_doy(60, 1984) == 60
-    assert mod.get_clim_doy(61, 1984) == 61
-    assert mod.get_clim_doy(59, 1985) == 60
-    assert mod.get_clim_doy(60, 1985) == 61
+def test_public_release_identity():
+    mod = load_core()
+    assert str(mod.ENGINE_VERSION).startswith("11.5")
 
 
-def test_moisture_physics():
-    T = np.array([25.0], dtype=np.float32)
-    Td = np.array([18.0], dtype=np.float32)
-    P = np.array([1005.0], dtype=np.float32)
-    d = mod.derive_moisture(T, Td, P)
-    assert 0 <= d["rh"][0] <= 100
-    assert d["e"][0] > 0
-    assert d["r"][0] > 0
-    assert 0 < d["q"][0] < d["r"][0]
+def test_temporal_state_has_33_bins():
+    mod = load_core()
+    assert mod.LEVEL_BINS["L1"] == (0, 1)
+    assert mod.LEVEL_BINS["L2"] == (1, 9)
+    assert mod.LEVEL_BINS["L3"] == (9, 33)
 
 
-def test_log_progress_single_definition():
+def test_primary_input_families_and_products():
+    mod = load_core()
+    assert tuple(mod.VARIABLES) == ("rh", "e", "r", "q")
+    assert ("rh", "q") in tuple(mod.PAIRS)
+
+
+def test_v11_5_cli_commands_are_present():
     source = CORE.read_text(encoding="utf-8")
-    assert source.count("def log_progress(") == 1
-    assert 'log_progress("STAGE", stage=' not in source
+    for command in ("selftest", "validate-input", "pilot", "run", "audit", "merge-audit", "report", "benchmark"):
+        assert f'"{command}"' in source
